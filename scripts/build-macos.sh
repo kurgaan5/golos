@@ -30,7 +30,12 @@ xcrun swiftc -swift-version 5 -O -g -target "$ARCH-apple-macosx14.0" -module-cac
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 "$APP/Contents/MacOS/Golos" --self-test
-"$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/mixed-test.wav"
+if [ "$ARCH" = x86_64 ]; then
+  xcrun lldb --batch -o run -o 'process status' -k 'thread backtrace all' -- "$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/mixed-test.wav" 2>&1 | tee "$BUILD/recognition-test.log"
+  grep -q 'exited with status = 0' "$BUILD/recognition-test.log"
+else
+  "$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/mixed-test.wav"
+fi
 cp "$ROOT/MACOS.txt" "$ROOT/dist/Как пользоваться.txt"
 NAME="Golos-1.7-macOS-$ARCH.zip"
 ditto -c -k --keepParent "$APP" "$ROOT/dist/$NAME"
