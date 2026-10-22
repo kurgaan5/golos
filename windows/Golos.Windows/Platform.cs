@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Automation;
 using System.Windows.Automation.Text;
+using Golos.Core;
 
 namespace Golos.Windows;
 
@@ -99,6 +100,7 @@ internal sealed class PinnedWriter
     }
     Target? target;
     readonly Queue<string> queue = new();
+    readonly Queue<(string Emitted, string Formatted)> formatting = new();
     string previous = "";
     public bool Busy { get; private set; }
     public int PendingCharacters => queue.Sum(s => s.Length);
@@ -106,7 +108,7 @@ internal sealed class PinnedWriter
     public string Status { get; private set; } = "";
     public async Task<bool> Capture()
     {
-        if (Busy || queue.Count > 0) return false;
+        if (Busy || queue.Count > 0 || formatting.Count > 0) return false;
         target = await Platform.OnSta(() =>
         {
             var field = AutomationElement.FocusedElement;
@@ -114,7 +116,7 @@ internal sealed class PinnedWriter
             var type = field.Current.ControlType;
             bool editable = false;
             if (field.TryGetCurrentPattern(ValuePattern.Pattern, out var value)) editable = !((ValuePattern)value).Current.IsReadOnly;
-            else if (type == ControlType.Document && field.TryGetCurrentPattern(TextPattern.Pattern, out var text))
+            else if (field.TryGetCurrentPattern(TextPattern.Pattern, out var text))
                 editable = ((TextPattern)text).DocumentRange.GetAttributeValue(TextPattern.IsReadOnlyAttribute) is false;
             if (!editable) return null;
             nint window = Platform.GetForegroundWindow();
@@ -149,20 +151,45 @@ internal sealed class PinnedWriter
     public string TakePending()
     {
         if (Busy) throw new InvalidOperationException("Дождитесь завершения текущей вставки.");
-        string text = string.Concat(queue); queue.Clear(); return text;
+        string text = string.Concat(queue); queue.Clear(); formatting.Clear(); return text;
+    }
+    public void FinalizeText(string emitted, string final)
+    {
+        if (emitted != final && FormattingPlan.SameWords(emitted, final)) formatting.Enqueue((emitted, final));
     }
     public async Task Tick()
     {
-        if (Busy || queue.Count == 0 || target == null) return;
-        var t = target; var text = queue.Peek(); Busy = true;
+        if (Busy || (queue.Count == 0 && formatting.Count == 0) || target == null) return;
+        var t = target; Busy = true;
         try
         {
+            if (queue.Count == 0)
+            {
+                var task = formatting.Dequeue();
+                await Platform.OnSta(() => Format(t, task.Emitted, task.Formatted)); return;
+            }
+            var text = queue.Peek();
             bool sent = await Platform.OnSta(() => Deliver(t, text));
             if (sent) queue.Dequeue();
             Status = sent ? "Текст вставлен." : t.Ambiguous ? "Вставка не подтверждена. Проверьте исходное поле; полная фраза есть в истории." : "Текст ждёт возвращения в исходное поле.";
         }
         catch (Exception) { Status = "Исходное поле недоступно. Текст сохранён в очереди и истории."; }
         finally { Busy = false; }
+    }
+    static bool Format(Target t, string emitted, string formatted)
+    {
+        if (t.Ambiguous || !Focused(t)) return false;
+        string? actual = Value(t);
+        if (actual == null || actual != t.Expected) return false;
+        ReadPosition(t);
+        // Restrict rewriting to the unchanged composer ending at its caret.
+        // Unsupported clients retain the final version in history instead.
+        if (t.Cursor != actual.Length || t.Selection != 0) return false;
+        var wanted = FormattingPlan.Replace(t.Expected, actual, emitted, formatted);
+        if (wanted == null || !t.Field.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern) || ((ValuePattern)pattern).Current.IsReadOnly) return false;
+        ((ValuePattern)pattern).SetValue(wanted);
+        if (Value(t) != wanted) return false;
+        ReadPosition(t); return true;
     }
     static bool Deliver(Target t, string text)
     {

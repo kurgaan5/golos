@@ -46,8 +46,10 @@ else
 fi
 NOISE_OUTPUT=$("$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/room-noise-test.wav")
 test -z "$NOISE_OUTPUT"
+test "$("$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/mixed-test.wav" --activity-only)" = SPEECH
+test "$("$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/room-noise-test.wav" --activity-only)" = SILENCE
 cp "$ROOT/MACOS.txt" "$ROOT/dist/Как пользоваться.txt"
-NAME="Golos-1.7.2-macOS-$ARCH.zip"
+NAME="Golos-1.7.3-macOS-$ARCH.zip"
 ditto -c -k --keepParent "$APP" "$ROOT/dist/$NAME"
 (cd "$ROOT/dist" && shasum -a 256 "$NAME" > "$NAME.sha256")
 STAGE="$BUILD/dmg"
@@ -55,7 +57,7 @@ mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/Голос.app"
 ln -sfn /Applications "$STAGE/Программы"
 cp "$ROOT/MACOS.txt" "$STAGE/Как установить.txt"
-DMG="Golos-1.7.2-macOS-$ARCH.dmg"
+DMG="Golos-1.7.3-macOS-$ARCH.dmg"
 hdiutil create -fs HFS+ -volname "Голос" -srcfolder "$STAGE" -format UDZO -ov "$ROOT/dist/$DMG"
 hdiutil verify "$ROOT/dist/$DMG"
 (cd "$ROOT/dist" && shasum -a 256 "$DMG" > "$DMG.sha256")

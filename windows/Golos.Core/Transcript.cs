@@ -4,12 +4,26 @@ namespace Golos.Core;
 
 public static class Transcript
 {
+    public static string SentenceCase(string text) => Regex.Replace(text, "(^|[.!?…]\\s+)([«“\"(\\[]*)([а-яё])", m => m.Groups[1].Value + m.Groups[2].Value + m.Groups[3].Value.ToUpperInvariant());
     public static string Clean(string raw)
     {
         var text = string.Concat(raw.EnumerateRunes().Where(r => !System.Text.Rune.IsLetter(r) ||
             r.Value is >= 0x41 and <= 0x24f or >= 0x400 and <= 0x52f or >= 0x1e00 and <= 0x1eff));
         text = Regex.Replace(text, @"\[[^\]]*\]|<\|[^|]*\|>|[«»„“”]", "");
         return Regex.Replace(text, @"\s+", " ").Trim();
+    }
+}
+
+public static class FormattingPlan
+{
+    static string[] Words(string text) => Regex.Matches(text, @"[\p{L}\p{N}]+").Select(m => m.Value.ToLowerInvariant().Replace('ё', 'е')).ToArray();
+    public static bool SameWords(string a, string b) { var words = Words(a); return words.Length > 0 && words.SequenceEqual(Words(b)); }
+    public static string? Replace(string? expected, string actual, string emitted, string formatted)
+    {
+        if (expected != actual || emitted == formatted || !SameWords(emitted, formatted)) return null;
+        int start = actual.IndexOf(emitted, StringComparison.Ordinal);
+        if (start < 0 || actual.IndexOf(emitted, start + emitted.Length, StringComparison.Ordinal) >= 0) return null;
+        return actual[..start] + formatted + actual[(start + emitted.Length)..];
     }
 }
 
@@ -26,7 +40,7 @@ public sealed class StableTranscript
     public string Offer(string hypothesis, bool final)
     {
         if (finished) return "";
-        var text = Transcript.Clean(hypothesis);
+        var text = Transcript.SentenceCase(Transcript.Clean(hypothesis));
         var current = Words(text);
         var candidate = text;
         if (!final)

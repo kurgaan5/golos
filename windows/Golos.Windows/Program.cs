@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.IO;
+using System.Diagnostics;
 using Golos.Core;
 using NAudio.Wave;
 using Microsoft.Win32;
@@ -77,11 +78,17 @@ internal sealed class MainWindow : Form
     readonly SemaphoreSlim nativeLock = new(1, 1);
     readonly bool preview;
     NativeRecognizer? engine;
+    NativeActivityDetector? activity;
+    readonly SpeechInactivity inactivity = new();
+    bool autoStoppedForSilence;
+    readonly ToolTip hints = new();
+    static double MonotonicTime => (double)Stopwatch.GetTimestamp() / Stopwatch.Frequency;
     WaveInEvent? microphone;
     Segmenter? segmenter;
     Vocabulary vocabulary = new("");
     volatile bool recording;
     bool decoding, starting, exiting, tickBusy, closingCapture;
+    int startGeneration;
     CaptureGate captureGate;
     readonly HistorySessions historySessions = new();
     Guid? captureHistoryId;
@@ -100,13 +107,14 @@ internal sealed class MainWindow : Form
         brand.Controls.Add(new Label { Text = "Голос", AutoSize = true, Font = new Font("Segoe UI", 26, FontStyle.Bold), Location = new Point(0, 0) });
         brand.Controls.Add(new Label { Text = "by Okulovsky", AutoSize = true, Font = new Font("Segoe UI", 9), ForeColor = Color.Gray, Location = new Point(3, 49) });
         top.Controls.Add(brand);
-        var settings = MakeButton("Настройки"); settings.Click += (_, _) => OpenSettings(); top.Controls.Add(settings);
+        var settings = MakeButton("⚙"); settings.Font = new Font("Segoe UI Symbol", 16); settings.AccessibleName = "Настройки";
+        hints.SetToolTip(settings, "Настройки"); settings.Click += (_, _) => OpenSettings(); top.Controls.Add(settings);
         accessPrompt.Controls.Add(accessPromptText);
         var openAudioSettings = MakeButton("Настройки Windows"); openAudioSettings.Click += (_, _) => OpenMicrophoneSettings(); accessPrompt.Controls.Add(openAudioSettings);
         var toolbar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 60 };
         toggle.ForeColor = Color.White; toggle.BackColor = Accent; toggle.Enabled = preview;
         toggle.Click += async (_, _) => await Toggle(); toolbar.Controls.Add(toggle);
-        var copyAll = MakeButton("Скопировать историю"); copyAll.Click += (_, _) => { if (history.Count > 0) Clipboard.SetText(string.Join(" ", history.Select(p => p.Text))); }; toolbar.Controls.Add(copyAll);
+        var copyAll = MakeButton("Скопировать историю"); copyAll.Click += (_, _) => { if (history.Count > 0) { Clipboard.SetText(string.Join(" ", history.Select(p => p.Text))); status.Text = "Текст скопирован."; } }; toolbar.Controls.Add(copyAll);
         copyPending.Click += (_, _) => { var text = writer.TakePending(); if (text.Length > 0) Clipboard.SetText(text); UpdateUi(); }; toolbar.Controls.Add(copyPending);
         Controls.Add(transcript); Controls.Add(toolbar); Controls.Add(state); Controls.Add(accessPrompt); Controls.Add(top); Controls.Add(status);
         var menu = new ContextMenuStrip(); menu.Items.Add("Начать / остановить", null, async (_, _) => await Toggle());
@@ -117,13 +125,26 @@ internal sealed class MainWindow : Form
         {
             try { hotkey = new GlobalHotkey { Preset = Math.Clamp(prefs.Shortcut, 0, 3) }; hotkey.Toggle += () => Ui(async () => await Toggle()); }
             catch (Exception e) { status.Text = "Горячая клавиша недоступна: " + e.Message; }
-            timer.Tick += async (_, _) => { if (tickBusy) return; tickBusy = true; try { await writer.Tick(); UpdateUi(); } finally { tickBusy = false; } }; timer.Start();
+            timer.Tick += async (_, _) =>
+            {
+                // Keep checking silence even if a slow UI Automation provider
+                // still has an asynchronous insertion transaction outstanding.
+                bool expired; lock (audioLock) expired = recording && inactivity.Expired(MonotonicTime);
+                if (expired) StopCapture(true);
+                if (tickBusy) return;
+                tickBusy = true;
+                try
+                {
+                    await writer.Tick(); UpdateUi();
+                }
+                finally { tickBusy = false; }
+            }; timer.Start();
             Shown += async (_, _) => await LoadModel();
             SystemEvents.PowerModeChanged += PowerChanged;
             SystemEvents.SessionSwitch += SessionChanged;
         }
         FormClosing += (_, e) => { if (!exiting) { Stop(); e.Cancel = true; Hide(); } };
-        FormClosed += (_, _) => { SystemEvents.PowerModeChanged -= PowerChanged; SystemEvents.SessionSwitch -= SessionChanged; timer.Dispose(); hotkey?.Dispose(); microphone?.Dispose(); tray.Dispose(); hud.Dispose(); if (!decoding) engine?.Dispose(); };
+        FormClosed += (_, _) => { SystemEvents.PowerModeChanged -= PowerChanged; SystemEvents.SessionSwitch -= SessionChanged; timer.Dispose(); hotkey?.Dispose(); microphone?.Dispose(); activity?.Dispose(); hints.Dispose(); tray.Dispose(); hud.Dispose(); if (!decoding) engine?.Dispose(); };
         if (!preview) audioAccess = MicrophoneAccess.Check(false);
         UpdateHistory(); UpdateUi();
     }
@@ -143,10 +164,15 @@ internal sealed class MainWindow : Form
         if (engine == null || starting || closingCapture) return;
         if (decoding || jobs.Count > 0 || writer.Busy || writer.PendingCharacters > 0) { status.Text = "Сначала завершите вставку предыдущего текста или скопируйте невставленное."; return; }
         starting = true;
+        int generation = ++startGeneration;
         try
         {
             if (!await writer.Capture()) { status.Text = "Выберите поле другого приложения и нажмите горячую клавишу."; return; }
+            if (generation != startGeneration || exiting) return;
             vocabulary = new Vocabulary(prefs.Words); ledgers.Clear();
+            var newActivity = await Task.Run(() => new NativeActivityDetector(Path.Combine(AppContext.BaseDirectory, "Resources", "ggml-silero-v5.1.2.bin")));
+            if (generation != startGeneration || exiting) { newActivity.Dispose(); return; }
+            activity = newActivity;
             var recordingId = historySessions.Begin(); captureHistoryId = recordingId;
             var currentVocabulary = vocabulary;
             var currentSegmenter = new Segmenter { Threshold = prefs.Threshold, Pause = prefs.Pause }; segmenter = currentSegmenter;
@@ -155,25 +181,30 @@ internal sealed class MainWindow : Form
                 if (historySessions.Register(recordingId, id)) Enqueue(new Job(id, audio, final, currentVocabulary));
             });
             var currentMicrophone = new WaveInEvent { DeviceNumber = -1, WaveFormat = new WaveFormat(16000, 16, 1), BufferMilliseconds = 50 }; microphone = currentMicrophone;
-            Guid captureId; lock (audioLock) captureId = captureGate.Begin();
+            Guid captureId; lock (audioLock) { captureId = captureGate.Begin(); inactivity.Begin(captureId, MonotonicTime); }
             currentMicrophone.DataAvailable += (_, e) =>
             {
-                lock (audioLock)
+                try
                 {
-                    if (!recording || !captureGate.Accepts(captureId)) return;
-                    var audio = new float[e.BytesRecorded / 2];
-                    for (int i = 0; i < audio.Length; i++) audio[i] = BitConverter.ToInt16(e.Buffer, i * 2) / 32768f;
-                    currentSegmenter.Accept(audio);
+                    lock (audioLock)
+                    {
+                        if (!recording || !captureGate.Accepts(captureId)) return;
+                        var audio = new float[e.BytesRecorded / 2];
+                        for (int i = 0; i < audio.Length; i++) audio[i] = BitConverter.ToInt16(e.Buffer, i * 2) / 32768f;
+                        if (activity?.Accept(audio) == true) inactivity.Heard(captureId, MonotonicTime);
+                        currentSegmenter.Accept(audio);
+                    }
                 }
+                catch (Exception error) { Ui(() => { if (ReferenceEquals(microphone, currentMicrophone)) { Stop(); status.Text = error.Message; } }); }
             };
             currentMicrophone.RecordingStopped += (_, e) => { if (e.Exception != null) Ui(() => { if (ReferenceEquals(microphone, currentMicrophone)) { Stop(); captureConfirmed = false; audioAccess = MicrophoneAccess.Check(false); status.Text = "Микрофон недоступен: " + e.Exception.Message; UpdateUi(); } }); };
-            recording = true; currentMicrophone.StartRecording(); captureConfirmed = true; audioAccess = AudioAccessState.Granted;
+            autoStoppedForSilence = false; recording = true; currentMicrophone.StartRecording(); captureConfirmed = true; audioAccess = AudioAccessState.Granted;
             status.Text = "Слушаю для «" + writer.Destination + "». Поле закреплено до остановки.";
         }
         catch (Exception e)
         {
             Stop();
-            lock (audioLock) captureGate.End();
+            lock (audioLock) { captureGate.End(); inactivity.End(); activity?.Dispose(); activity = null; }
             microphone?.Dispose(); microphone = null;
             if (captureHistoryId is Guid failed) { historySessions.End(failed); historySessions.Prune(history.Select(p => p.Id)); captureHistoryId = null; }
             status.Text = "Не удалось начать запись. Проверьте микрофон и доступ в настройках Windows. " + e.Message;
@@ -181,11 +212,14 @@ internal sealed class MainWindow : Form
         }
         finally { starting = false; UpdateUi(); }
     }
-    void Stop()
+    void Stop() => StopCapture(false);
+    void StopCapture(bool silence)
     {
+        startGeneration++;
         if (!recording) return;
         var recordingId = captureHistoryId; closingCapture = true;
-        lock (audioLock) { recording = false; captureGate.End(); segmenter?.Flush(); }
+        lock (audioLock) { recording = false; captureGate.End(); inactivity.End(); segmenter?.Flush(); activity?.Dispose(); activity = null; }
+        autoStoppedForSilence = silence;
         microphone?.StopRecording();
         microphone?.Dispose(); microphone = null;
         // Snapshot callbacks were queued under audioLock; close behind them.
@@ -194,7 +228,7 @@ internal sealed class MainWindow : Form
             if (recordingId is Guid id) { historySessions.End(id); PublishHistory(id); }
             captureHistoryId = null; closingCapture = false; UpdateUi();
         });
-        status.Text = "Микрофон выключен. Завершаю уже записанную фразу."; UpdateUi();
+        status.Text = silence ? "Диктовка остановлена: 3 минуты без речи." : "Микрофон выключен. Завершаю уже записанную фразу."; UpdateUi();
     }
     void Enqueue(Job job)
     {
@@ -225,6 +259,7 @@ internal sealed class MainWindow : Form
                 writer.Enqueue(stable.Offer(text, job.Final));
                 if (job.Final)
                 {
+                    writer.FinalizeText(stable.Committed, text);
                     if (historySessions.Finish(job.Id, text) is Guid id) PublishHistory(id);
                     ledgers.Remove(job.Id);
                 }
@@ -255,7 +290,7 @@ internal sealed class MainWindow : Form
         state.Text = recording ? "Слушаю вас" : engine == null && !preview ? "Загружаю модель…" : decoding ? "Микрофон выключен · завершаю распознавание…" : "Микрофон выключен";
         copyPending.Enabled = writer.PendingCharacters > 0 && !writer.Busy && !recording && !decoding;
         if (writer.PendingCharacters > 0) status.Text = writer.Status + " Ожидает символов: " + writer.PendingCharacters;
-        bool show = prefs.ShowPanel && (recording || decoding || writer.PendingCharacters > 0);
+        bool show = prefs.ShowPanel && !autoStoppedForSilence && (recording || decoding || writer.PendingCharacters > 0);
         if (show) { hud.UpdateText(recording ? "●  Слушаю · " + writer.Destination : decoding ? "Обрабатываю речь…" : "Текст ждёт вставки · " + writer.PendingCharacters); if (!hud.Visible) hud.Show(); }
         else hud.Hide();
     }
@@ -289,7 +324,8 @@ internal sealed class MainWindow : Form
         var keys = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 280 }; keys.Items.AddRange(GlobalHotkey.Labels); keys.SelectedIndex = Math.Clamp(prefs.Shortcut, 0, 3);
         keys.SelectedIndexChanged += (_, _) => { prefs.Shortcut = keys.SelectedIndex; if (hotkey != null) hotkey.Preset = prefs.Shortcut; SavePrefs(); }; box.Controls.Add(keys);
         box.Controls.Add(new Label { Text = "Основной язык — русский. Поле закреплено на всю запись.\nДля нового поля остановите и запустите диктовку заново.\nАудио не сохраняется и не отправляется в интернет.", AutoSize = true, Margin = new Padding(0, 18, 0, 10) });
-        var version = new Label { Text = "Голос 1.7.2", AutoSize = true, ForeColor = Color.Gray, Margin = new Padding(0, 18, 0, 0) };
+        box.Controls.Add(new Label { Text = "После 3 минут без речи микрофон выключается.\nПока вы говорите, отсчёт сбрасывается.", AutoSize = true, Margin = new Padding(0, 5, 0, 10) });
+        var version = new Label { Text = "Голос 1.7.3", AutoSize = true, ForeColor = Color.Gray, Margin = new Padding(0, 18, 0, 0) };
         long clicked = 0; int count = 0;
         version.MouseDown += (_, _) => { long now = Environment.TickCount64; count = now - clicked < 1200 ? count + 1 : 1; clicked = now; if (count == 3) { count = 0; DeveloperAccess(dialog); } }; box.Controls.Add(version);
         dialog.Controls.Add(box); dialog.ShowDialog(this);

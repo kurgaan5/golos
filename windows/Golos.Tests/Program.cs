@@ -7,6 +7,19 @@ static string Stream(params string[] variants)
     Check(stable.Offer(variants[^1], true) == "", "Repeated final"); return text;
 }
 Check(Transcript.Clean("근데Когда 今天 обсуждаем product roadmap.") == "Когда обсуждаем product roadmap.", "Script filtering");
+Check(Transcript.SentenceCase("это проверка. дальше текст! еще? да. product roadmap и ChatGPT.") == "Это проверка. Дальше текст! Еще? Да. product roadmap и ChatGPT.", "Russian sentence case and brand names");
+Check(Stream("привет", "привет мир", "привет мир сегодня", "привет мир сегодня.") == "Привет мир сегодня.", "Lowercase streaming start");
+const string unformatted = "Раньше. Я думаю это работает. Дальше.";
+Check(FormattingPlan.Replace(unformatted, unformatted, "Я думаю это работает.", "Я думаю, это работает.") == "Раньше. Я думаю, это работает. Дальше.", "Final punctuation of owned span");
+Check(FormattingPlan.Replace("Старое", "Моя правка", "Старое", "Старое.") == null, "Keep manual changes");
+Check(FormattingPlan.Replace("Да Да", "Да Да", "Да", "Да.") == null, "Reject ambiguous owned span");
+var inactivity = new SpeechInactivity(); var idleCapture = Guid.NewGuid();
+inactivity.Begin(idleCapture, 0);
+Check(!inactivity.Expired(179.99) && inactivity.Expired(180), "Three minutes of silence");
+inactivity.Heard(idleCapture, 179); Check(!inactivity.Expired(358.99) && inactivity.Expired(359), "Speech resets timer");
+for (int time = 180; time <= 1800; time += 5) { inactivity.Heard(idleCapture, time); Check(!inactivity.Expired(time), "Speaking has no recording time limit"); }
+inactivity.End(); Check(!inactivity.Expired(5000), "Stopped capture has no timer");
+inactivity.Begin(Guid.NewGuid(), 2000); inactivity.Heard(idleCapture, 2170); Check(inactivity.Expired(2180), "Reject old activity");
 Check(Stream("Привет", "Привет мир", "Привет мир сегодня", "Привет мир сегодня.") == "Привет мир сегодня.", "Streaming");
 Check(Stream("Очень", "Очень очень", "Очень очень важно", "Очень очень важно.") == "Очень очень важно.", "Intentional repetitions");
 Check(Stream("Сегодня обсуждаем product", "Сегодня обсуждаем product roadmap", "Сегодня обсуждаем product roadmap и user research.") == "Сегодня обсуждаем product roadmap и user research.", "Mixed speech");
@@ -62,6 +75,12 @@ if (args.Length > 0)
     Console.WriteLine(text);
     Check(text.Contains("roadmap", StringComparison.OrdinalIgnoreCase) && text.Contains("research", StringComparison.OrdinalIgnoreCase), "Native mixed ASR");
     Check(recognizer.Transcribe(ReadWave(Path.Combine(root, "room-noise-test.wav")), true, vocabulary) == "", "Noise rejection");
+    using var detector = new NativeActivityDetector(Path.Combine(Path.GetDirectoryName(args[0])!, "ggml-silero-v5.1.2.bin"));
+    var mixed = ReadWave(Path.Combine(root, "mixed-test.wav")); bool speech = false;
+    foreach (var chunk in mixed.Chunk(800)) speech |= detector.Accept(chunk);
+    Check(speech, "Independent VAD recognizes speech");
+    using var noiseDetector = new NativeActivityDetector(Path.Combine(Path.GetDirectoryName(args[0])!, "ggml-silero-v5.1.2.bin"));
+    Check(!ReadWave(Path.Combine(root, "room-noise-test.wav")).Chunk(800).Select(c => noiseDetector.Accept(c)).Any(x => x), "Independent VAD ignores room noise");
     Console.WriteLine("PASS: native model load, mixed Russian/English ASR, noise rejection");
 }
 static float[] ReadWave(string path)

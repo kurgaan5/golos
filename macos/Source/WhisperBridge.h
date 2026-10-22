@@ -3,6 +3,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+void *golos_activity_create(const char *model_path);
+int golos_activity_detect(void *context, const float *samples, int count);
+void golos_activity_destroy(void *context);
 void * golos_create(const char *model_path);
 int golos_vocabulary_count(void *context, const char *vocabulary);
 char * golos_transcribe(void *context, const float *samples, int count, const char *language, int final_pass, const char *vocabulary);

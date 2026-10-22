@@ -21,7 +21,7 @@ public sealed class NativeRecognizer : IDisposable
         if (audio.Length < 16000) { audio = (float[])audio.Clone(); Array.Resize(ref audio, 16000); }
         nint raw = golos_transcribe(context, audio, audio.Length, "ru", final ? 1 : 0, vocabulary.Prompt);
         if (raw == 0) throw new InvalidOperationException("Не удалось распознать фразу. Проверьте свободную память.");
-        try { return vocabulary.Canonicalize(Transcript.Clean(Marshal.PtrToStringUTF8(raw) ?? "")); }
+        try { return Transcript.SentenceCase(vocabulary.Canonicalize(Transcript.Clean(Marshal.PtrToStringUTF8(raw) ?? ""))); }
         finally { golos_free_text(raw); }
     }
     public void Dispose() { if (context == 0) return; golos_destroy(context); context = 0; }

@@ -5,7 +5,7 @@ on:
       version:
         description: Release tag
         required: true
-        default: v1.7.2
+        default: v1.7.3
       platform:
         description: Platforms to build
         type: choice
@@ -89,4 +89,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          for file in packages/*.zip packages/*.dmg packages/*-Setup.exe packages/*.sha256; do
+            [[ "$(basename "$file")" == "Golos-$version-"* ]]
+          done
+          (cd packages && for checksum in *.sha256; do sha256sum -c "$checksum"; done)
           gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" --title "Голос ${RELEASE_TAG#v}" --notes-file RELEASE.md packages/*.zip packages/*.dmg packages/*-Setup.exe packages/*.sha256

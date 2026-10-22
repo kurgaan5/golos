@@ -41,6 +41,25 @@ static int set_vocabulary(GolosContext *state, const char *vocabulary) {
 }
 
 extern "C" {
+void * golos_activity_create(const char *path) {
+    auto params = whisper_vad_default_context_params();
+    params.n_threads = 2; params.use_gpu = false;
+    return whisper_vad_init_from_file_with_params(path, params);
+}
+int golos_activity_detect(void *context, const float *samples, int count) {
+    auto *vad = static_cast<whisper_vad_context *>(context);
+    if (!vad || !samples) return -1;
+    if (count < 1600) return 0;
+    if (!whisper_vad_detect_speech(vad, samples, count)) return -1;
+    int speech_frames = 0;
+    const int n = whisper_vad_n_probs(vad);
+    const auto *probs = whisper_vad_probs(vad);
+    for (int i = 0; i < n; ++i) if (probs[i] >= 0.5f) ++speech_frames;
+    return speech_frames >= 3 ? 1 : 0;
+}
+void golos_activity_destroy(void *context) {
+    if (context) whisper_vad_free(static_cast<whisper_vad_context *>(context));
+}
 void * golos_create(const char *path) {
     static std::once_flag backends;
     std::call_once(backends, [] { ggml_backend_load_all(); });
