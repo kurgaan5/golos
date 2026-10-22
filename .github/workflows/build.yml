@@ -35,6 +35,7 @@ jobs:
           name: windows-${{ matrix.arch }}
           path: |
             dist/*.zip
+            dist/*-Setup.exe
             dist/*.sha256
             dist/*.png
           compression-level: 0
@@ -51,6 +52,7 @@ jobs:
           name: macos-intel
           path: |
             dist/*.zip
+            dist/*.dmg
             dist/*.sha256
           compression-level: 0
           if-no-files-found: error
@@ -73,4 +75,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" --title "Голос ${RELEASE_TAG#v}" --notes-file RELEASE.md packages/*.zip packages/*.sha256
+          gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" --title "Голос ${RELEASE_TAG#v}" --notes-file RELEASE.md packages/*.zip packages/*.dmg packages/*-Setup.exe packages/*.sha256
