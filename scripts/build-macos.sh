@@ -23,8 +23,14 @@ cp "$SOURCE/Info.plist" "$APP/Contents/Info.plist"
 cp "$SOURCE/AppIcon.icns" "$ROOT/ThirdPartyNotices.txt" "$APP/Contents/Resources/"
 xcrun clang++ -std=c++17 -O3 -mmacosx-version-min=14.0 -I "$WHISPER/include" -I "$WHISPER/ggml/include" -c "$SOURCE/WhisperBridge.cpp" -o "$BUILD/WhisperBridge.o"
 EXTRA_LIBS=("$BUILD/ggml/src/libggml-cpu.a")
+SWIFT_OPT=-O
+if [ "$ARCH" = x86_64 ]; then
+  # Swift 6.1's optimized x86_64 closure captures corrupt the CLI snapshot count.
+  # Keep the Swift controller unoptimized; all Whisper kernels remain optimized C++.
+  SWIFT_OPT=-Onone
+fi
 if [ "$ARCH" != x86_64 ]; then EXTRA_LIBS+=("$BUILD/ggml/src/ggml-metal/libggml-metal.a" "$BUILD/ggml/src/ggml-blas/libggml-blas.a"); fi
-xcrun swiftc -swift-version 5 -O -g -target "$ARCH-apple-macosx14.0" -module-cache-path "$BUILD/swift-cache" -import-objc-header "$SOURCE/WhisperBridge.h" "$SOURCE/main.swift" "$SOURCE/SpeechVocabulary.swift" "$SOURCE/DeveloperPassword.swift" "$BUILD/WhisperBridge.o" \
+xcrun swiftc -swift-version 5 "$SWIFT_OPT" -g -target "$ARCH-apple-macosx14.0" -module-cache-path "$BUILD/swift-cache" -import-objc-header "$SOURCE/WhisperBridge.h" "$SOURCE/main.swift" "$SOURCE/SpeechVocabulary.swift" "$SOURCE/DeveloperPassword.swift" "$BUILD/WhisperBridge.o" \
   "$BUILD/src/libwhisper.a" "$BUILD/ggml/src/libggml.a" "$BUILD/ggml/src/libggml-base.a" "${EXTRA_LIBS[@]}" \
   -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework Accelerate -framework Metal -framework MetalKit -framework Foundation -lc++ -o "$APP/Contents/MacOS/Golos"
 codesign --force --deep --sign - "$APP"
