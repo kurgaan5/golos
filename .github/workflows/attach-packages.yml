@@ -6,8 +6,8 @@ on:
         description: Successful Windows build run ID
         required: true
       macos_run:
-        description: Successful Intel Mac build run ID
-        required: true
+        description: Successful Intel Mac run ID (optional)
+        required: false
       version:
         description: Existing draft release tag
         required: true
@@ -29,11 +29,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$WINDOWS_RUN" =~ ^[0-9]+$ && "$MACOS_RUN" =~ ^[0-9]+$ ]]
+          [[ "$WINDOWS_RUN" =~ ^[0-9]+$ ]]
           gh api "repos/$GH_REPO/actions/runs/$WINDOWS_RUN/jobs" > windows.json
           jq -e '[.jobs[] | select(.name | startswith("windows ("))] | length == 2 and all(.status == "completed" and .conclusion == "success")' windows.json
-          gh api "repos/$GH_REPO/actions/runs/$MACOS_RUN/jobs" > macos.json
-          jq -e '[.jobs[] | select(.name == "macos-intel")] | length == 1 and all(.status == "completed" and .conclusion == "success")' macos.json
+          if [[ -n "$MACOS_RUN" ]]; then
+            [[ "$MACOS_RUN" =~ ^[0-9]+$ ]]
+            gh api "repos/$GH_REPO/actions/runs/$MACOS_RUN/jobs" > macos.json
+            jq -e '[.jobs[] | select(.name == "macos-intel")] | length == 1 and all(.status == "completed" and .conclusion == "success")' macos.json
+          fi
           gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
       - uses: actions/download-artifact@v8
         with:
@@ -43,16 +46,24 @@ jobs:
           path: packages
           merge-multiple: true
       - uses: actions/download-artifact@v8
+        if: inputs.macos_run != ''
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.macos_run }}
           pattern: macos-*
           path: packages
           merge-multiple: true
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-previews
+          path: packages/*.png
+          if-no-files-found: error
       - name: Verify and attach installers
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           cd packages
           for checksum in *.sha256; do sha256sum -c "$checksum"; done
-          gh release upload "$RELEASE_TAG" --clobber *.zip *.dmg *-Setup.exe *.sha256
+          files=(*.zip *.dmg *-Setup.exe *.sha256)
+          gh release upload "$RELEASE_TAG" --clobber "${files[@]}"
