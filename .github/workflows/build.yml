@@ -1,0 +1,76 @@
+name: Build downloadable applications
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag
+        required: true
+        default: v1.7.0
+permissions:
+  contents: read
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Build, test model, render UI, package
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -Arch '${{ matrix.arch }}'
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/*.png
+          compression-level: 0
+          if-no-files-found: error
+  macos-intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build, test model, package
+        run: bash scripts/build-macos.sh
+      - uses: actions/upload-artifact@v6
+        with:
+          name: macos-intel
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          compression-level: 0
+          if-no-files-found: error
+  draft-release:
+    needs: [windows, macos-intel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Create draft with tested packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" --draft --target "$GITHUB_SHA" --title "Голос ${RELEASE_TAG#v}" --notes-file RELEASE.md packages/*.zip packages/*.sha256
