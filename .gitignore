@@ -1,0 +1,12 @@
+.DS_Store
+**/bin/
+**/obj/
+.build/
+.cache/
+dist/
+work/
+*.app/
+*.zip
+*.pdb
+*.user
+*.log
