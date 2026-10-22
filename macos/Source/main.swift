@@ -1568,15 +1568,14 @@ if let index = CommandLine.arguments.firstIndex(of: "--transcribe-file"), Comman
         let vocabulary = SpeechVocabulary(custom: custom)
         let used = vocabulary.prompt.withCString { golos_vocabulary_count(context, $0) }
         if CommandLine.arguments.contains("--stream-benchmark") { print("VOCABULARY: custom=\(vocabulary.customTerms.count) total=\(vocabulary.terms.count) prompt=\(used)") }
-        let duration = Double(output.frameLength) / 16000
-        let durations = CommandLine.arguments.contains("--stream-benchmark") ? Array(stride(from: 1.0, to: duration, by: 0.5)) + [duration] : [duration]
+        let frameCount = Int(output.frameLength)
+        let frameCounts = CommandLine.arguments.contains("--stream-benchmark") ? Array(stride(from: 16000, to: frameCount, by: 8000)) + [frameCount] : [frameCount]
         let language = "ru"
         var stable = StableTranscript()
         var combined = ""
-        for (step, seconds) in durations.enumerated() {
-            let count = min(Int(output.frameLength), Int(seconds * 16000))
+        for (step, count) in frameCounts.enumerated() {
             let start = Date()
-            let final = step == durations.count - 1
+            let final = step == frameCounts.count - 1
             guard let raw = vocabulary.prompt.withCString({ prompt in language.withCString { golos_transcribe(context, output.floatChannelData![0], Int32(count), $0, final ? 1 : 0, prompt) } }) else { fatalError("Transcription") }
             let text = vocabulary.canonicalize(Transcript.clean(String(cString: raw)))
             if CommandLine.arguments.contains("--stream-benchmark") { print("audio=\(Double(count) / 16000)s decode=\(String(format: "%.2f", Date().timeIntervalSince(start)))s: \(text)") }
