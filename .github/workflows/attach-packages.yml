@@ -1,0 +1,44 @@
+name: Attach tested packages to release draft
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful build run ID
+        required: true
+      version:
+        description: Existing draft release tag
+        required: true
+        default: v1.7.0
+permissions:
+  actions: read
+  contents: write
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_RUN: ${{ inputs.run_id }}
+      RELEASE_TAG: ${{ inputs.version }}
+    steps:
+      - name: Require all platform checks to pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN" =~ ^[0-9]+$ ]]
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN/jobs" > jobs.json
+          jq -e '[.jobs[] | select(.name == "macos-intel" or (.name | startswith("windows (")))] | length == 3 and all(.status == "completed" and .conclusion == "success")' jobs.json
+          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
+      - uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          path: packages
+          merge-multiple: true
+      - name: Verify and attach installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd packages
+          for checksum in *.sha256; do sha256sum -c "$checksum"; done
+          gh release upload "$RELEASE_TAG" --clobber *.zip *.dmg *-Setup.exe *.sha256
