@@ -2,8 +2,11 @@ name: Attach tested packages to release draft
 on:
   workflow_dispatch:
     inputs:
-      run_id:
-        description: Successful build run ID
+      windows_run:
+        description: Successful Windows build run ID
+        required: true
+      macos_run:
+        description: Successful Intel Mac build run ID
         required: true
       version:
         description: Existing draft release tag
@@ -18,21 +21,32 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      BUILD_RUN: ${{ inputs.run_id }}
+      WINDOWS_RUN: ${{ inputs.windows_run }}
+      MACOS_RUN: ${{ inputs.macos_run }}
       RELEASE_TAG: ${{ inputs.version }}
     steps:
       - name: Require all platform checks to pass
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$BUILD_RUN" =~ ^[0-9]+$ ]]
-          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN/jobs" > jobs.json
-          jq -e '[.jobs[] | select(.name == "macos-intel" or (.name | startswith("windows (")))] | length == 3 and all(.status == "completed" and .conclusion == "success")' jobs.json
+          [[ "$WINDOWS_RUN" =~ ^[0-9]+$ && "$MACOS_RUN" =~ ^[0-9]+$ ]]
+          gh api "repos/$GH_REPO/actions/runs/$WINDOWS_RUN/jobs" > windows.json
+          jq -e '[.jobs[] | select(.name | startswith("windows ("))] | length == 2 and all(.status == "completed" and .conclusion == "success")' windows.json
+          gh api "repos/$GH_REPO/actions/runs/$MACOS_RUN/jobs" > macos.json
+          jq -e '[.jobs[] | select(.name == "macos-intel")] | length == 1 and all(.status == "completed" and .conclusion == "success")' macos.json
           gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
       - uses: actions/download-artifact@v8
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.run_id }}
+          run-id: ${{ inputs.windows_run }}
+          pattern: windows-*
+          path: packages
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.macos_run }}
+          pattern: macos-*
           path: packages
           merge-multiple: true
       - name: Verify and attach installers

@@ -6,10 +6,16 @@ on:
         description: Release tag
         required: true
         default: v1.7.0
+      platform:
+        description: Platforms to build
+        type: choice
+        options: [all, intel, windows]
+        default: all
 permissions:
   contents: read
 jobs:
   windows:
+    if: inputs.platform != 'intel'
     strategy:
       fail-fast: false
       matrix:
@@ -41,12 +47,19 @@ jobs:
           compression-level: 0
           if-no-files-found: error
   macos-intel:
+    if: inputs.platform != 'windows'
     runs-on: macos-15-intel
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - name: Build, test model, package
         run: bash scripts/build-macos.sh
+      - name: Diagnose recognition crash
+        if: failure()
+        run: |
+          for report in "$HOME"/Library/Logs/DiagnosticReports/Golos*; do
+            if [ -f "$report" ]; then cat "$report"; fi
+          done
       - uses: actions/upload-artifact@v6
         with:
           name: macos-intel
@@ -57,6 +70,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
   draft-release:
+    if: inputs.platform == 'all'
     needs: [windows, macos-intel]
     runs-on: ubuntu-latest
     permissions:
