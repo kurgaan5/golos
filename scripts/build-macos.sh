@@ -11,14 +11,24 @@ if [ ! -d "$WHISPER" ]; then
   curl --fail --location --retry 3 https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.8.2.tar.gz -o "$ROOT/.build/whisper.tar.gz"
   tar -xzf "$ROOT/.build/whisper.tar.gz" -C "$ROOT/.build"
 fi
-cmake -S "$WHISPER" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_CURL=OFF -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_NATIVE=OFF -DGGML_ACCELERATE=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+CPU_FLAGS=()
+if [ "$ARCH" = x86_64 ]; then
+  # Keep Intel packages usable on older Macs and virtual machines.
+  for FLAG in SSE42 AVX AVX2 FMA F16C BMI2 AVX_VNNI AVX512 AVX512_VBMI AVX512_VNNI; do
+    CPU_FLAGS+=("-DGGML_${FLAG}=OFF")
+  done
+  CPU_FLAGS+=("-DGGML_METAL=OFF")
+fi
+cmake -S "$WHISPER" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_CURL=OFF -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_NATIVE=OFF -DGGML_ACCELERATE=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 "${CPU_FLAGS[@]}"
 cmake --build "$BUILD" --parallel 4
 python3 "$ROOT/scripts/fetch-models.py" "$APP/Contents/Resources"
 cp "$SOURCE/Info.plist" "$APP/Contents/Info.plist"
 cp "$SOURCE/AppIcon.icns" "$ROOT/ThirdPartyNotices.txt" "$APP/Contents/Resources/"
 xcrun clang++ -std=c++17 -O3 -mmacosx-version-min=14.0 -I "$WHISPER/include" -I "$WHISPER/ggml/include" -c "$SOURCE/WhisperBridge.cpp" -o "$BUILD/WhisperBridge.o"
+METAL_LIB=()
+if [ "$ARCH" != x86_64 ]; then METAL_LIB+=("$BUILD/ggml/src/ggml-metal/libggml-metal.a"); fi
 xcrun swiftc -swift-version 5 -O -target "$ARCH-apple-macosx14.0" -module-cache-path "$BUILD/swift-cache" -import-objc-header "$SOURCE/WhisperBridge.h" "$SOURCE/main.swift" "$SOURCE/SpeechVocabulary.swift" "$SOURCE/DeveloperPassword.swift" "$BUILD/WhisperBridge.o" \
-  "$BUILD/src/libwhisper.a" "$BUILD/ggml/src/libggml.a" "$BUILD/ggml/src/libggml-base.a" "$BUILD/ggml/src/libggml-cpu.a" "$BUILD/ggml/src/ggml-metal/libggml-metal.a" "$BUILD/ggml/src/ggml-blas/libggml-blas.a" \
+  "$BUILD/src/libwhisper.a" "$BUILD/ggml/src/libggml.a" "$BUILD/ggml/src/libggml-base.a" "$BUILD/ggml/src/libggml-cpu.a" "${METAL_LIB[@]}" "$BUILD/ggml/src/ggml-blas/libggml-blas.a" \
   -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework Accelerate -framework Metal -framework MetalKit -framework Foundation -lc++ -o "$APP/Contents/MacOS/Golos"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
