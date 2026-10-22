@@ -19,7 +19,9 @@ if ($LASTEXITCODE) { throw 'Native compilation failed' }
 $package=Join-Path $root "dist/Golos-1.7-Windows-$Arch"
 dotnet publish "$root/windows/Golos.Windows/Golos.Windows.csproj" -c Release -r "win-$Arch" --self-contained true -p:PublishSingleFile=false -o $package
 if ($LASTEXITCODE) { throw 'Managed publish failed' }
-Copy-Item "$build/Release/golos_native.dll" $package
+$nativeLibraries=Get-ChildItem $build -Filter '*.dll' -Recurse
+if (!$nativeLibraries -or !($nativeLibraries.Name -contains 'golos_native.dll')) { throw 'Native DLLs missing' }
+$nativeLibraries | ForEach-Object { Copy-Item $_.FullName $package -Force }
 Copy-Item "$root/ThirdPartyNotices.txt", "$root/WINDOWS.txt" $package
 Copy-Item "$root/licenses" $package -Recurse -Force
 python "$PSScriptRoot/fetch-models.py" "$package/Resources"
@@ -27,7 +29,7 @@ if ($LASTEXITCODE) { throw 'Model verification failed' }
 $tests=Join-Path $root ".build/tests-$Arch"
 dotnet publish "$root/windows/Golos.Tests/Golos.Tests.csproj" -c Release -r "win-$Arch" --self-contained true -o $tests
 if ($LASTEXITCODE) { throw 'Test compilation failed' }
-Copy-Item "$build/Release/golos_native.dll" $tests
+$nativeLibraries | ForEach-Object { Copy-Item $_.FullName $tests -Force }
 & "$tests/Golos.Tests.exe" "$package/Resources/ggml-large-v3-turbo-q5_0.bin" "$root/tests/fixtures"
 if ($LASTEXITCODE) { throw 'Recognition tests failed' }
 $preview=Start-Process "$package/Golos.exe" -ArgumentList @('--render-ui',"`"$root/dist/Windows-$Arch.png`"") -PassThru -Wait

@@ -1,5 +1,7 @@
 #include "WhisperBridge.h"
 #include "whisper.h"
+#include "ggml-backend.h"
+#include <mutex>
 #include <string>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +42,8 @@ static int set_vocabulary(GolosContext *state, const char *vocabulary) {
 
 extern "C" {
 void * golos_create(const char *path) {
+    static std::once_flag backends;
+    std::call_once(backends, [] { ggml_backend_load_all(); });
     auto params = whisper_context_default_params();
     params.use_gpu = false;
     auto *ctx = whisper_init_from_file_with_params(path, params);
