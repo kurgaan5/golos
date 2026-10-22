@@ -11,7 +11,7 @@ if [ ! -d "$WHISPER" ]; then
   curl --fail --location --retry 3 https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.8.2.tar.gz -o "$ROOT/.build/whisper.tar.gz"
   tar -xzf "$ROOT/.build/whisper.tar.gz" -C "$ROOT/.build"
 fi
-CPU_FLAGS=()
+CPU_FLAGS=(-DGGML_NATIVE=OFF)
 if [ "$ARCH" = x86_64 ]; then
   # Keep Intel packages usable on older Macs and virtual machines.
   for FLAG in SSE42 AVX AVX2 FMA F16C BMI2 AVX_VNNI AVX512 AVX512_VBMI AVX512_VNNI; do
@@ -25,10 +25,10 @@ python3 "$ROOT/scripts/fetch-models.py" "$APP/Contents/Resources"
 cp "$SOURCE/Info.plist" "$APP/Contents/Info.plist"
 cp "$SOURCE/AppIcon.icns" "$ROOT/ThirdPartyNotices.txt" "$APP/Contents/Resources/"
 xcrun clang++ -std=c++17 -O3 -mmacosx-version-min=14.0 -I "$WHISPER/include" -I "$WHISPER/ggml/include" -c "$SOURCE/WhisperBridge.cpp" -o "$BUILD/WhisperBridge.o"
-METAL_LIB=()
-if [ "$ARCH" != x86_64 ]; then METAL_LIB+=("$BUILD/ggml/src/ggml-metal/libggml-metal.a"); fi
+EXTRA_LIBS=("$BUILD/ggml/src/ggml-blas/libggml-blas.a")
+if [ "$ARCH" != x86_64 ]; then EXTRA_LIBS+=("$BUILD/ggml/src/ggml-metal/libggml-metal.a"); fi
 xcrun swiftc -swift-version 5 -O -target "$ARCH-apple-macosx14.0" -module-cache-path "$BUILD/swift-cache" -import-objc-header "$SOURCE/WhisperBridge.h" "$SOURCE/main.swift" "$SOURCE/SpeechVocabulary.swift" "$SOURCE/DeveloperPassword.swift" "$BUILD/WhisperBridge.o" \
-  "$BUILD/src/libwhisper.a" "$BUILD/ggml/src/libggml.a" "$BUILD/ggml/src/libggml-base.a" "$BUILD/ggml/src/libggml-cpu.a" "${METAL_LIB[@]}" "$BUILD/ggml/src/ggml-blas/libggml-blas.a" \
+  "$BUILD/src/libwhisper.a" "$BUILD/ggml/src/libggml.a" "$BUILD/ggml/src/libggml-base.a" "$BUILD/ggml/src/libggml-cpu.a" "${EXTRA_LIBS[@]}" \
   -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework Accelerate -framework Metal -framework MetalKit -framework Foundation -lc++ -o "$APP/Contents/MacOS/Golos"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
