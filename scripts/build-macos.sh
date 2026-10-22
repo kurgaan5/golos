@@ -33,9 +33,13 @@ codesign --verify --deep --strict "$APP"
 if [ "$ARCH" = x86_64 ]; then
   xcrun lldb --batch -o run -o 'process status' -k 'thread backtrace all' -- "$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/mixed-test.wav" 2>&1 | tee "$BUILD/recognition-test.log"
   grep -q 'exited with status = 0' "$BUILD/recognition-test.log"
+  grep -qi 'roadmap' "$BUILD/recognition-test.log"
+  grep -qi 'research' "$BUILD/recognition-test.log"
 else
   "$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/mixed-test.wav"
 fi
+NOISE_OUTPUT=$("$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/room-noise-test.wav")
+test -z "$NOISE_OUTPUT"
 cp "$ROOT/MACOS.txt" "$ROOT/dist/Как пользоваться.txt"
 NAME="Golos-1.7-macOS-$ARCH.zip"
 ditto -c -k --keepParent "$APP" "$ROOT/dist/$NAME"
@@ -46,6 +50,6 @@ ditto "$APP" "$STAGE/Голос.app"
 ln -sfn /Applications "$STAGE/Программы"
 cp "$ROOT/MACOS.txt" "$STAGE/Как установить.txt"
 DMG="Golos-1.7-macOS-$ARCH.dmg"
-hdiutil create -volname "Голос" -srcfolder "$STAGE" -format UDZO -ov "$ROOT/dist/$DMG"
+hdiutil create -fs HFS+ -volname "Голос" -srcfolder "$STAGE" -format UDZO -ov "$ROOT/dist/$DMG"
 hdiutil verify "$ROOT/dist/$DMG"
 (cd "$ROOT/dist" && shasum -a 256 "$DMG" > "$DMG.sha256")
