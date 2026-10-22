@@ -3,12 +3,118 @@ import SwiftUI
 import AVFoundation
 import Carbon
 import ApplicationServices
+import Darwin
+
+// Hold an OS lock for the lifetime of the GUI process. A second copy must never
+// install its hotkey or construct an audio engine, even when launched from a DMG.
+final class InstanceLease {
+    private let descriptor: Int32
+    private init(_ descriptor: Int32) { self.descriptor = descriptor }
+    static func acquire(at url: URL) throws -> InstanceLease? {
+        let fd = Darwin.open(url.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 { return InstanceLease(fd) }
+        let failure = errno
+        Darwin.close(fd)
+        if failure == EWOULDBLOCK || failure == EAGAIN { return nil }
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+    }
+    deinit { flock(descriptor, LOCK_UN); Darwin.close(descriptor) }
+}
+
+// Buffers copied by an old input tap cannot enter a later recording.
+struct CaptureGate {
+    private var current: UUID?
+    mutating func begin() -> UUID { let id = UUID(); current = id; return id }
+    mutating func end() { current = nil }
+    func accepts(_ id: UUID) -> Bool { current == id }
+}
+
+struct RightCommandGesture {
+    private var pressedAt: TimeInterval?
+    private var used = false
+    private var lastTimestamp: TimeInterval = -1
+    mutating func observe(_ event: NSEvent) -> Bool {
+        // AppKit raises an exception when keyCode is read from a mouse event.
+        let code: UInt16 = event.type == .flagsChanged || event.type == .keyDown ? event.keyCode : 0
+        return observe(type: event.type, code: code, flags: event.modifierFlags, timestamp: event.timestamp)
+    }
+    mutating func observe(type: NSEvent.EventType, code: UInt16, flags: NSEvent.ModifierFlags, timestamp: TimeInterval) -> Bool {
+        // The event tap and the local monitor can receive the same physical event.
+        guard timestamp != lastTimestamp else { return false }
+        lastTimestamp = timestamp
+        if type == .flagsChanged && code == 54 {
+            if flags.contains(.command) {
+                pressedAt = timestamp
+                used = !flags.intersection([.shift, .control, .option]).isEmpty
+            } else {
+                defer { pressedAt = nil }
+                guard let start = pressedAt else { return false }
+                return !used && timestamp >= start && timestamp - start < 1.2
+            }
+        } else if pressedAt != nil { used = true }
+        return false
+    }
+}
 
 struct Phrase: Codable, Identifiable {
     var id = UUID()
     let date: Date
     let text: String
     var delivered: Bool
+}
+
+// One history record belongs to one explicit microphone start/stop, regardless
+// of silence boundaries or the recognizer's hard segment limit.
+struct HistorySessions {
+    private struct Segment { var text: String?; var delivered = false }
+    private struct Session {
+        let date: Date
+        var ended = false
+        var order: [UUID] = []
+        var segments: [UUID: Segment] = [:]
+        var complete: Bool { ended && segments.values.allSatisfy { $0.text != nil } }
+    }
+    private var sessions: [UUID: Session] = [:]
+    private var owners: [UUID: UUID] = [:]
+
+    mutating func begin(date: Date = Date()) -> UUID {
+        let id = UUID(); sessions[id] = Session(date: date); return id
+    }
+    func owner(of segment: UUID) -> UUID? { owners[segment] }
+    mutating func register(_ segment: UUID, in id: UUID) {
+        guard owners[segment] == nil, var session = sessions[id], !session.ended else { return }
+        session.order.append(segment); session.segments[segment] = Segment()
+        sessions[id] = session; owners[segment] = id
+    }
+    @discardableResult mutating func finish(_ segment: UUID, text: String, delivered: Bool) -> UUID? {
+        guard let id = owners[segment], var session = sessions[id], var part = session.segments[segment] else { return nil }
+        part.text = text; part.delivered = part.delivered || delivered
+        session.segments[segment] = part; sessions[id] = session; return id
+    }
+    @discardableResult mutating func confirm(_ segment: UUID) -> UUID? {
+        guard let id = owners[segment], var session = sessions[id], var part = session.segments[segment] else { return nil }
+        part.delivered = true; session.segments[segment] = part; sessions[id] = session; return id
+    }
+    @discardableResult mutating func discard(_ segment: UUID) -> UUID? {
+        guard let id = owners.removeValue(forKey: segment), var session = sessions[id] else { return nil }
+        session.order.removeAll { $0 == segment }; session.segments.removeValue(forKey: segment)
+        sessions[id] = session; return id
+    }
+    mutating func end(_ id: UUID) { sessions[id]?.ended = true }
+    func entry(_ id: UUID) -> Phrase? {
+        guard let session = sessions[id], session.complete else { return nil }
+        let parts = session.order.compactMap { session.segments[$0] }.filter { !($0.text ?? "").isEmpty }
+        var text = ""
+        for part in parts { text += Transcript.prefix(previous: text, text: part.text!) }
+        guard !text.isEmpty else { return nil }
+        return Phrase(id: id, date: session.date, text: text, delivered: parts.allSatisfy { $0.delivered })
+    }
+    mutating func prune(preserving ids: Set<UUID>) {
+        let removed = Set(sessions.filter { $0.value.complete && !ids.contains($0.key) }.map(\.key))
+        for id in removed { sessions.removeValue(forKey: id) }
+        owners = owners.filter { !removed.contains($0.value) }
+    }
 }
 
 struct Shortcut: Codable, Equatable {
@@ -72,7 +178,7 @@ enum Diagnostics {
             guard let handle = try? FileHandle(forWritingTo: url) else { return }
             defer { try? handle.close() }
             _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data("\(Date().timeIntervalSince1970) \(event)\n".utf8))
+            try? handle.write(contentsOf: Data("\(Date().timeIntervalSince1970) pid=\(ProcessInfo.processInfo.processIdentifier) \(event)\n".utf8))
         }
     }
 }
@@ -203,6 +309,7 @@ final class Microphone {
     private var voiced = 0
     private var quiet = 0
     private var active = false
+    private var captureGate = CaptureGate()
     private var threshold: Float = -42
     private var pauseSamples = 16000
     private var segmentID = UUID()
@@ -225,10 +332,11 @@ final class Microphone {
               let converter = AVAudioConverter(from: format, to: target) else {
             throw NSError(domain: "Голос", code: 1, userInfo: [NSLocalizedDescriptionKey: "Микрофон недоступен. Проверьте выбранный вход в настройках звука macOS."])
         }
-        audioQueue.sync {
+        let captureID = audioQueue.sync { () -> UUID in
             self.converter = converter; self.samples = []; self.preroll = []
             self.voiced = 0; self.quiet = 0; self.active = true
             self.segmentID = UUID(); self.lastSnapshot = 0
+            return self.captureGate.begin()
         }
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
             guard let self,
@@ -241,12 +349,12 @@ final class Microphone {
                     memcpy(destination, source, Int(src[i].mDataByteSize))
                 }
             }
-            self.audioQueue.async { self.consume(copy) }
+            self.audioQueue.async { self.consume(copy, captureID: captureID) }
         }
         do { engine.prepare(); try engine.start() }
         catch {
             input.removeTap(onBus: 0)
-            audioQueue.sync { self.active = false }
+            audioQueue.sync { self.active = false; self.captureGate.end() }
             throw error
         }
     }
@@ -255,11 +363,11 @@ final class Microphone {
         engine.inputNode.removeTap(onBus: 0)
         audioQueue.sync {
             flush()
-            active = false; converter = nil; preroll = []
+            active = false; captureGate.end(); converter = nil; preroll = []
         }
     }
-    private func consume(_ input: AVAudioPCMBuffer) {
-        guard active, let converter else { return }
+    private func consume(_ input: AVAudioPCMBuffer, captureID: UUID) {
+        guard active, captureGate.accepts(captureID), let converter else { return }
         let capacity = AVAudioFrameCount(Double(input.frameLength) * 16000 / input.format.sampleRate + 128)
         guard let output = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else { return }
         var supplied = false
@@ -347,6 +455,24 @@ final class Recognizer {
     }
 }
 
+// Some Qt editors expose AXStaticText while providing a writable text value.
+// Accept the focused writable text, but keep read-only labels and containers out.
+enum EditableFieldPolicy {
+    static func accepts(role: String, valueWritable: Bool) -> Bool {
+        if [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role) { return true }
+        return role == kAXStaticTextRole && valueWritable
+    }
+}
+
+// Qt can advertise writable AXValue yet return a permanently empty value.
+// Its text-range interface is authoritative; otherwise treat the editor as opaque.
+enum EditorTextPolicy {
+    static func read(role: String, value: String?, rangeText: String?) -> String? {
+        if role == kAXStaticTextRole { return rangeText }
+        return value ?? rangeText
+    }
+}
+
 enum DeliveryMethod: String, Hashable { case paste, selectedText, value }
 
 enum DeliveryPolicy {
@@ -405,6 +531,22 @@ final class TextInserter {
         var value: CFTypeRef?
         return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
     }
+    private func textValue(_ field: AXUIElement) -> String? {
+        let role = attribute(field, kAXRoleAttribute) as? String ?? ""
+        let value = role == kAXStaticTextRole ? nil : attribute(field, kAXValueAttribute) as? String
+        if let value { return value }
+        var rangeText: String?
+        if let count = (attribute(field, kAXNumberOfCharactersAttribute) as? NSNumber)?.intValue, count >= 0 {
+            var range = CFRange(location: 0, length: count)
+            if let parameter = AXValueCreate(.cfRange, &range) {
+                var result: CFTypeRef?
+                if AXUIElementCopyParameterizedAttributeValue(field, kAXStringForRangeParameterizedAttribute as CFString, parameter, &result) == .success {
+                    rangeText = result as? String
+                }
+            }
+        }
+        return EditorTextPolicy.read(role: role, value: value, rangeText: rangeText)
+    }
     private func focused(_ pid: pid_t) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.12)
@@ -428,7 +570,7 @@ final class TextInserter {
         if (attribute(field, kAXSubroleAttribute) as? String) == kAXSecureTextFieldSubrole { return false }
         if let enabled = attribute(field, kAXEnabledAttribute) as? Bool, !enabled { return false }
         if let canEdit = attribute(field, "AXEditable") as? Bool, !canEdit { return false }
-        return [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role)
+        return EditableFieldPolicy.accepts(role: role, valueWritable: settable(field, kAXValueAttribute))
     }
     private func element(_ value: CFTypeRef?) -> AXUIElement? {
         guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
@@ -464,7 +606,7 @@ final class TextInserter {
         guard editable(field) else { return nil }
         var pid: pid_t = 0
         guard AXUIElementGetPid(field, &pid) == .success, pid != ProcessInfo.processInfo.processIdentifier else { return nil }
-        let value = attribute(field, kAXValueAttribute) as? String
+        let value = textValue(field)
         let selection = caret(field) ?? (value == "" ? CFRange(location: 0, length: 0) : nil)
         let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "Приложение"
         Diagnostics.log("target.capture app=\(name) role=\(attribute(field, kAXRoleAttribute) as? String ?? "?") readable=\(value != nil) caret=\(selection != nil) valueWritable=\(settable(field, kAXValueAttribute)) selectedWritable=\(settable(field, kAXSelectedTextAttribute))")
@@ -473,9 +615,16 @@ final class TextInserter {
         return Target(pid: pid, name: name, field: field, window: window, context: context, identifier: identifier(field), contextURL: url(context), windowTitle: window.flatMap { attribute($0, kAXTitleAttribute) as? String }, value: value, selection: selection)
     }
     private func activate(_ target: Target?) {
-        if let old = active, let target, CFEqual(old.field, target.field) {
-            active = old; old.disabledMethods.remove(.paste)
-            destinationName = old.name; return
+        if let target {
+            // An explicit new start captures a fresh caret and document context.
+            // Retire old delivery attempts for this same physical field, so an
+            // earlier composer state cannot block or replay into the new session.
+            let previous = targets.filter { CFEqual($0.field, target.field) }
+            for old in previous {
+                for id in sessions.filter({ $0.value.target === old }).map(\.key) { sessions.removeValue(forKey: id) }
+                if !old.pending.isEmpty { Diagnostics.log("target.retired_pending chars=\((old.pending as NSString).length) retained_in_history=true") }
+            }
+            targets.removeAll { old in previous.contains { $0 === old } }
         }
         active = target
         if let target { targets.append(target); destinationName = target.name }
@@ -523,7 +672,7 @@ final class TextInserter {
         retryPending()
         let delivered = target.pending.isEmpty && !target.uncertain
         if delivered { confirmFinals(target) }
-        completion(delivered, target.pending.isEmpty ? "Ввод в «\(target.name)»" : !target.reported.isEmpty ? target.reported : "Слушаю для «\(target.name)». Ожидаю безопасной вставки в исходное поле.")
+        completion(delivered, target.pending.isEmpty ? "Ввод в «\(target.name)»" : !target.reported.isEmpty ? target.reported : "Текст для «\(target.name)» ждёт вставки в исходное поле.")
     }
     private func isFocused(_ target: Target) -> Bool {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid, let field = focused(target.pid) else { return false }
@@ -556,7 +705,7 @@ final class TextInserter {
             continue
         }
         let foreground = isFocused(target)
-        let baseline = attribute(target.field, kAXValueAttribute) as? String
+        let baseline = textValue(target.field)
         let currentCaret = foreground ? caret(target.field) : nil
         if let baseline {
             guard let range = InsertionPlan.rebase(expected: target.value, actual: baseline, selection: target.selection, focusedCaret: currentCaret) else {
@@ -651,7 +800,7 @@ final class TextInserter {
     private func verify(_ target: Target, addition: String, baseline: String?, desired: String?, method: DeliveryMethod, restore: (() -> Void)?, attempt: Int = 0) {
         let delay = method == .paste && desired == nil ? 0.4 : 0.15
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            let actual = self.attribute(target.field, kAXValueAttribute) as? String
+            let actual = self.textValue(target.field)
             if let desired, actual != desired, (actual == nil || actual == baseline), attempt < 4 {
                 self.verify(target, addition: addition, baseline: baseline, desired: desired, method: method, restore: restore, attempt: attempt + 1)
                 return
@@ -705,12 +854,11 @@ final class Hotkey {
     private var local: Any?
     private var reference: EventHotKeyRef?
     private var handler: EventHandlerRef?
-    private var pressedAt: Date?
-    private var commandUsed = false
+    private var rightCommandGesture = RightCommandGesture()
     private var eventTap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var lastInputTimestamp: TimeInterval = -1
-    var hookReady: Bool { shortcut != .rightCommand ? reference != nil : eventTap != nil }
+    var hookReady: Bool { shortcut != .rightCommand ? reference != nil : eventTap.map { CGEvent.tapIsEnabled(tap: $0) } == true }
 
     func install(_ shortcut: Shortcut) -> Bool {
         self.shortcut = shortcut
@@ -719,7 +867,7 @@ final class Hotkey {
         if let reference { UnregisterEventHotKey(reference) }; reference = nil
         if let tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes) }; tapSource = nil
         if let eventTap { CFMachPortInvalidate(eventTap) }; eventTap = nil
-        pressedAt = nil; commandUsed = false
+        rightCommandGesture = RightCommandGesture()
         if handler == nil {
             var type = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             InstallEventHandler(GetApplicationEventTarget(), { _, _, data in
@@ -737,6 +885,8 @@ final class Hotkey {
                 guard let data else { return Unmanaged.passUnretained(event) }
                 let owner = Unmanaged<Hotkey>.fromOpaque(data).takeUnretainedValue()
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    owner.rightCommandGesture = RightCommandGesture()
+                    Diagnostics.log("hotkey.tap_reenabled reason=\(type.rawValue)")
                     if let tap = owner.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
                 } else if let nsEvent = NSEvent(cgEvent: event) {
                     owner.observe(nsEvent)
@@ -788,21 +938,9 @@ final class Hotkey {
             }
         }
         guard shortcut == .rightCommand, !capturing else { return }
-        if event.type == .flagsChanged && event.keyCode == 54 {
-            // Device-specific flag bits are not consistently preserved by NSEvent.
-            // The virtual key code identifies the right Command; the public flag gives its state.
-            let isDown = event.modifierFlags.contains(.command)
-            if isDown {
-                pressedAt = Date()
-                let extras = event.modifierFlags.intersection([.shift, .control, .option])
-                commandUsed = !extras.isEmpty
-            } else {
-                if let start = pressedAt, !commandUsed, Date().timeIntervalSince(start) < 1.2 {
-                    DispatchQueue.main.async { self.onToggle?() }
-                }
-                pressedAt = nil
-            }
-        } else if pressedAt != nil { commandUsed = true }
+        if rightCommandGesture.observe(event) {
+            DispatchQueue.main.async { self.onToggle?() }
+        }
     }
 }
 
@@ -814,6 +952,9 @@ final class Model: ObservableObject {
     @Published var status = "Загружаю локальную модель…"
     @Published var history: [Phrase] = []
     @Published var accessible = AXIsProcessTrusted()
+    @Published var accessibilityCheckedAt: Date?
+    @Published var microphoneAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
+    @Published var microphoneCheckedAt: Date?
     @Published var shortcut = Shortcut.rightCommand
     @Published var settings = false
     @Published var developerPrompt = false
@@ -861,6 +1002,9 @@ final class Model: ObservableObject {
     private struct Job { let id: UUID; let samples: [Float]; let final: Bool; let vocabulary: SpeechVocabulary }
     private var jobs: [Job] = []
     private var decoding = false
+    private var historySessions = HistorySessions()
+    private var captureHistoryID: UUID?
+    private var closingCapture = false
     var transcript: String { history.reversed().map(\.text).joined(separator: " ") }
 
     init(preview: Bool = false) {
@@ -879,7 +1023,7 @@ final class Model: ObservableObject {
             guard let self else { return }
             self.shortcutHits += 1
             if self.testingShortcut { self.status = "Горячая клавиша распознана."; return }
-            self.toggle()
+            self.toggle(source: "hotkey")
         }
         hotkey.onUserInput = { [weak self] event in
             guard let self, self.recording || self.pending > 0 else { return }
@@ -887,8 +1031,8 @@ final class Model: ObservableObject {
         }
         inserter.onStatus = { [weak self] message in self?.status = message }
         inserter.onConfirmed = { [weak self] id in
-            guard let self, let index = self.history.firstIndex(where: { $0.id == id }) else { return }
-            self.history[index].delivered = true; self.saveHistory()
+            guard let self, let recordingID = self.historySessions.confirm(id) else { return }
+            self.publishHistory(recordingID)
         }
         hotkey.onCapture = { [weak self] value in self?.capturingShortcut = false; self?.setShortcut(value) }
         _ = hotkey.install(shortcut)
@@ -896,18 +1040,26 @@ final class Model: ObservableObject {
         configureAudio()
         microphone.onSpeechStart = { [weak self] id in
             guard let self else { return }
+            if let recordingID = self.captureHistoryID { self.historySessions.register(id, in: recordingID) }
             self.liveTarget = self.inserter.begin(id)
         }
-        microphone.onDiscard = { [weak self] id in self?.inserter.cancel(id) }
+        microphone.onDiscard = { [weak self] id in
+            guard let self else { return }
+            self.inserter.cancel(id)
+            if let recordingID = self.historySessions.discard(id) { self.publishHistory(recordingID) }
+        }
         microphone.onSnapshot = { [weak self] id, samples, final in self?.enqueue(id: id, samples: samples, final: final) }
         microphone.onLevel = { [weak self] value in self?.level = value }
-        microphone.onError = { [weak self] message in self?.stop(); self?.status = message }
+        microphone.onError = { [weak self] message in self?.stop(reason: "audio_error"); self?.status = message }
         observers.append(NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.recording else { return }
-            self.stop(); self.status = "Аудиоустройство изменилось. Нажмите горячую клавишу, чтобы продолжить."
+            self.stop(reason: "audio_device_changed"); self.status = "Аудиоустройство изменилось. Нажмите горячую клавишу, чтобы продолжить."
         })
         observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.recording else { return }; self.stop(); self.status = "Запись остановлена перед сном Mac."
+            guard let self, self.recording else { return }; self.stop(reason: "sleep"); self.status = "Запись остановлена перед сном Mac."
+        })
+        observers.append(DistributedNotificationCenter.default().addObserver(forName: NSNotification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
+            self?.stop(reason: "screen_locked")
         })
         observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.refreshPermissions() })
         guard let path = Bundle.main.path(forResource: "ggml-large-v3-turbo-q5_0", ofType: "bin") else { status = "Не найдена модель Whisper Turbo в приложении."; return }
@@ -956,9 +1108,34 @@ final class Model: ObservableObject {
     }
     func refreshPermissions() {
         let was = accessible; accessible = AXIsProcessTrusted()
+        microphoneAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
+        if microphoneAuthorization != .authorized && recording { stop(reason: "microphone_revoked") }
+        if !accessible && recording { stop(reason: "access_revoked") }
         if accessible && (!was || !hotkey.hookReady) { _ = hotkey.install(shortcut) }
         shortcutReady = hotkey.hookReady
         onState?()
+    }
+    func checkAccessibility() {
+        refreshPermissions(); accessibilityCheckedAt = Date()
+    }
+    func checkMicrophonePermission() {
+        refreshPermissions(); microphoneCheckedAt = Date()
+    }
+    var microphonePermissionTitle: String {
+        switch microphoneAuthorization {
+        case .authorized: return "Микрофон разрешён"
+        case .notDetermined: return "Микрофон: нужен доступ"
+        default: return "Микрофон не разрешён"
+        }
+    }
+    func requestMicrophonePermission() {
+        guard microphoneAuthorization == .notDetermined else {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+            return
+        }
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
+            DispatchQueue.main.async { self?.checkMicrophonePermission() }
+        }
     }
     func requestAccessibility() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -975,17 +1152,21 @@ final class Model: ObservableObject {
         UserDefaults.standard.set(try? JSONEncoder().encode(value), forKey: "shortcut")
         status = "Горячая клавиша: \(value.label)"; onState?()
     }
-    func toggle() {
-        if recording { stop(); return }
+    func toggle(source: String = "button") {
+        Diagnostics.log("recording.request source=\(source) wasRecording=\(recording)")
+        if recording { stop(reason: source); return }
         guard ready, !permissionPending else { return }
+        guard pending == 0, !inserter.isInserting, !closingCapture else {
+            status = "Микрофон выключен. Дождитесь завершения предыдущей фразы и нажмите ещё раз."; return
+        }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: start()
+        case .authorized: start(source: source)
         case .notDetermined:
             permissionPending = true
             AVCaptureDevice.requestAccess(for: .audio) { allowed in
                 DispatchQueue.main.async {
                     self.permissionPending = false
-                    if allowed { self.start() } else { self.status = "Разрешите микрофон в настройках конфиденциальности macOS." }
+                    if allowed { self.start(source: source) } else { self.status = "Разрешите микрофон в настройках конфиденциальности macOS." }
                 }
             }
         default:
@@ -993,22 +1174,35 @@ final class Model: ObservableObject {
             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
         }
     }
-    private func start() {
+    private func start(source: String) {
         do {
             guard inserter.startDictation() else { status = "Сначала выберите текстовое поле, затем нажмите горячую клавишу."; return }
             captureVocabulary = SpeechVocabulary(custom: customVocabulary)
             try microphone.start(); recording = true
+            captureHistoryID = historySessions.begin()
+            Diagnostics.log("recording.started source=\(source) destination=\(inserter.destinationName)")
             liveText = ""; liveTarget = inserter.destinationName
             activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: "Непрерывная локальная диктовка")
             status = "Слушаю для «\(liveTarget)». Поле закреплено до остановки записи."
         } catch { status = error.localizedDescription }
         onState?()
     }
-    func stop() {
+    func stop(reason: String = "button") {
         guard recording else { return }
+        let stoppedHistoryID = captureHistoryID
+        closingCapture = true
         microphone.stop(); recording = false; level = 0
+        // Microphone.stop synchronously drains its audio queue. Its final callbacks
+        // are already queued on main; close this history session behind that fence.
+        DispatchQueue.main.async {
+            if let id = stoppedHistoryID {
+                self.historySessions.end(id); self.publishHistory(id)
+            }
+            self.captureHistoryID = nil; self.closingCapture = false
+        }
+        Diagnostics.log("recording.stopped reason=\(reason)")
         if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
-        status = pending > 0 ? "Завершаю распознавание…" : "Запись остановлена."
+        status = "Микрофон выключен. Завершаю уже записанную фразу."
         onState?()
     }
     func checkFocus() {
@@ -1020,6 +1214,8 @@ final class Model: ObservableObject {
         if changed { onState?() }
     }
     private func enqueue(id: UUID, samples: [Float], final: Bool) {
+        guard let recordingID = historySessions.owner(of: id) ?? captureHistoryID else { return }
+        historySessions.register(id, in: recordingID)
         let job = Job(id: id, samples: samples, final: final, vocabulary: captureVocabulary)
         if let index = jobs.firstIndex(where: { $0.id == id }) {
             if !jobs[index].final { jobs[index] = job }
@@ -1041,16 +1237,25 @@ final class Model: ObservableObject {
                     self.liveText = text
                     self.inserter.update(job.id, text: text, final: job.final) { delivered, message in
                         if job.final {
-                            self.history.insert(Phrase(id: job.id, date: Date(), text: text, delivered: delivered), at: 0)
-                            self.history = Array(self.history.prefix(100)); self.saveHistory()
+                            if let recordingID = self.historySessions.finish(job.id, text: text, delivered: delivered) {
+                                self.publishHistory(recordingID)
+                            }
                         }
                         self.status = message
                     }
                 } else {
-                    if job.final { self.inserter.update(job.id, text: "", final: true) { _, _ in } }
-                    self.status = self.recording ? "Слушаю…" : "Запись остановлена."
+                    if job.final {
+                        self.inserter.update(job.id, text: "", final: true) { _, _ in }
+                        if let recordingID = self.historySessions.finish(job.id, text: "", delivered: true) { self.publishHistory(recordingID) }
+                    }
+                    self.status = self.recording ? "Слушаю…" : "Микрофон выключен."
                 }
-            case .failure(let error): self.status = error.localizedDescription
+            case .failure(let error):
+                self.status = error.localizedDescription
+                if job.final {
+                    self.inserter.cancel(job.id)
+                    if let recordingID = self.historySessions.finish(job.id, text: "", delivered: false) { self.publishHistory(recordingID) }
+                }
             }
             self.pending = self.jobs.count
             self.decodeNext()
@@ -1098,7 +1303,17 @@ final class Model: ObservableObject {
         if !text.isEmpty { copy(text); status = "Невставленный текст скопирован; очередь убрана. Фразы остались в истории." }
         checkFocus(); onState?()
     }
-    func clear() { history = []; saveHistory() }
+    private func publishHistory(_ recordingID: UUID) {
+        if let entry = historySessions.entry(recordingID) {
+            if let index = history.firstIndex(where: { $0.id == recordingID }) { history[index] = entry }
+            else { history.insert(entry, at: 0) }
+            history = Array(history.prefix(100)); saveHistory()
+        }
+        historySessions.prune(preserving: Set(history.map(\.id)))
+    }
+    func clear() {
+        history = []; historySessions.prune(preserving: []); saveHistory()
+    }
     private func saveHistory() {
         do { let data = try JSONEncoder().encode(history); try data.write(to: historyURL, options: .atomic); try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: historyURL.path) }
         catch { status = "Не удалось сохранить историю: \(error.localizedDescription)" }
@@ -1115,6 +1330,7 @@ struct ContentView: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Голос").font(.system(size: 32, weight: .bold, design: .rounded))
+                    Text("by Okulovsky").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
                     Text("Русская диктовка с английскими терминами.").foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -1130,7 +1346,7 @@ struct ContentView: View {
                 }.buttonStyle(.plain).disabled(!model.ready).help(model.recording ? "Остановить диктовку" : "Начать диктовку")
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text(model.recording ? "Слушаю вас" : model.ready ? "Готов к диктовке" : "Загружаю Whisper…").font(.system(size: 21, weight: .semibold))
+                        Text(model.recording ? "Слушаю вас" : model.pending > 0 ? "Микрофон выключен · обрабатываю" : model.ready ? "Микрофон выключен" : "Загружаю Whisper…").font(.system(size: 21, weight: .semibold))
                         if model.pending > 0 { ProgressView().controlSize(.small); Text("\(model.pending)").foregroundStyle(.secondary) }
                     }
                     Text(model.recording ? "Текст появляется во время речи" : "Выберите поле и нажмите \(model.shortcut.label)").foregroundStyle(.secondary)
@@ -1144,17 +1360,30 @@ struct ContentView: View {
             }.padding(22).frame(maxWidth: .infinity, alignment: .leading).background(.white, in: RoundedRectangle(cornerRadius: 24))
             if !model.accessible {
                 HStack(spacing: 12) {
-                    Image(systemName: "keyboard.badge.ellipsis").font(.title2)
+                    Image(systemName: "keyboard.badge.ellipsis").font(.title2).foregroundStyle(accent)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Разрешите ввод в другие приложения").fontWeight(.semibold)
                         Text("«Универсальный доступ» нужен для горячей клавиши и вставки текста.").font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Button("Разрешить") { model.requestAccessibility() }.buttonStyle(.borderedProminent).tint(accent)
-                }.padding(16).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+                }.padding(16).background(.white, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(accent.opacity(0.12)))
+            } else if model.microphoneAuthorization == .denied || model.microphoneAuthorization == .restricted {
+                HStack(spacing: 12) {
+                    Image(systemName: "mic.slash").font(.title2).foregroundStyle(accent)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Разрешите доступ к микрофону").fontWeight(.semibold)
+                        Text("Микрофон запрещён в macOS. Проверить доступ можно в настройках «Голоса».")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Настройки macOS") { model.requestMicrophonePermission() }.buttonStyle(.bordered).tint(accent)
+                }.padding(16).background(.white, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(accent.opacity(0.12)))
             }
             HStack {
-                Text("Последние фразы").font(.system(size: 16, weight: .semibold))
+                Text("История диктовок").font(.system(size: 16, weight: .semibold))
                 Spacer()
                 if model.waitingCharacters > 0 {
                     Button("Скопировать невставленное") { model.copyUndelivered() }
@@ -1167,7 +1396,7 @@ struct ContentView: View {
             if model.history.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "waveform").font(.system(size: 34)).foregroundStyle(accent.opacity(0.65))
-                    Text("Здесь сохранятся ваши фразы").font(.system(size: 16, weight: .medium))
+                    Text("Здесь появятся ваши диктовки").font(.system(size: 16, weight: .medium))
                     Text("Откройте любое текстовое поле и нажмите \(model.shortcut.label).\nТекст появляется во время речи, подтверждённые слова добавляются по ходу речи.")
                         .font(.system(size: 13)).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(4)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1198,20 +1427,70 @@ struct ContentView: View {
         .padding(28).frame(minWidth: 720, minHeight: 620).foregroundStyle(ink)
         .background(Color(red: 0.95, green: 0.96, blue: 0.98))
         .sheet(isPresented: $model.settings, onDismiss: { model.capturingShortcut = false; model.hotkey.capturing = false; model.closeDeveloperAccess() }) { SettingsView(model: model) }
-        .alert("Очистить историю фраз?", isPresented: $model.confirmClear) { Button("Отмена", role: .cancel) {}; Button("Очистить", role: .destructive) { model.clear() } } message: { Text("Вставленный в другие приложения текст останется на месте.") }
+        .alert("Очистить историю диктовок?", isPresented: $model.confirmClear) { Button("Отмена", role: .cancel) {}; Button("Очистить", role: .destructive) { model.clear() } } message: { Text("Вставленный в другие приложения текст останется на месте.") }
+    }
+}
+
+struct PermissionStatusRow: View {
+    let title: String
+    let subtitle: String
+    let icon: String
+    let granted: Bool
+    let checkedAt: Date?
+    var actionTitle = "Настройки macOS"
+    let check: () -> Void
+    let openSettings: () -> Void
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 18))
+                .foregroundStyle(granted ? Color(red: 0.20, green: 0.48, blue: 0.34) : accent)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                if let checkedAt {
+                    HStack(spacing: 3) { Text("Проверено в"); Text(checkedAt, style: .time) }
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                } else { Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary) }
+            }
+            Spacer(minLength: 4)
+            Button("Проверить", action: check).help("Проверить разрешение без включения записи")
+            Button(actionTitle, action: openSettings).help("Разрешение в настройках macOS")
+        }.controlSize(.small).padding(12)
+            .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
 struct SettingsView: View {
     @ObservedObject var model: Model
     var body: some View {
-        ScrollView {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("Настройки").font(.system(size: 25, weight: .bold))
+        VStack(spacing: 0) {
+            HStack {
+                Text("Настройки").font(.system(size: 25, weight: .bold))
+                Spacer()
+                Button { model.settings = false } label: {
+                    Image(systemName: "xmark").font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary).frame(width: 28, height: 28)
+                        .background(Color.primary.opacity(0.06), in: Circle())
+                }.buttonStyle(.plain).keyboardShortcut(.cancelAction)
+                    .accessibilityLabel("Закрыть настройки").help("Закрыть настройки")
+            }.padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 18)
+            ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+            VStack(spacing: 8) {
+                PermissionStatusRow(title: model.accessible ? "Доступ предоставлен" : "Нужен доступ к вводу",
+                    subtitle: "Универсальный доступ macOS", icon: model.accessible ? "checkmark.shield" : "keyboard.badge.ellipsis",
+                    granted: model.accessible, checkedAt: model.accessibilityCheckedAt,
+                    check: model.checkAccessibility, openSettings: model.requestAccessibility)
+                PermissionStatusRow(title: model.microphonePermissionTitle,
+                    subtitle: "Доступ к микрофону macOS", icon: model.microphoneAuthorization == .authorized ? "mic" : "mic.slash",
+                    granted: model.microphoneAuthorization == .authorized, checkedAt: model.microphoneCheckedAt,
+                    actionTitle: model.microphoneAuthorization == .notDetermined ? "Разрешить" : "Настройки macOS",
+                    check: model.checkMicrophonePermission, openSettings: model.requestMicrophonePermission)
+            }
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("Показывать панель диктовки", isOn: $model.showRecordingPanel)
                     .toggleStyle(.switch).tint(accent)
-                Text("При скрытой панели управляйте диктовкой горячей клавишей или через значок микрофона в строке меню.")
+                Text("При скрытой панели управляйте диктовкой горячей клавишей или через значок микрофона в строке меню. Закрытие главного окна выключает микрофон.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Divider()
@@ -1224,13 +1503,6 @@ struct SettingsView: View {
                     Button(model.capturingShortcut ? "Нажмите сочетание…" : "Задать свою…") { model.capturingShortcut = true; model.hotkey.capturing = true }
                 }
                 Text("Правый ⌘: короткое одиночное нажатие. Сочетания ⌘C, ⌘V и другие продолжают работать. Для своей комбинации используйте ⌃, ⌥ или ⌘ с клавишей. Esc — отмена.").font(.system(size: 12)).foregroundStyle(.secondary)
-                HStack {
-                    Button(model.testingShortcut ? "Проверяю… Нажмите клавишу" : "Проверить клавишу (10 с)") { model.testShortcut() }
-                        .disabled(model.recording || model.testingShortcut)
-                    Text("Нажатий: \(model.shortcutHits)").font(.system(size: 12, design: .monospaced))
-                }
-                Text(model.shortcutReady ? "Системный обработчик клавиши подключён" : "Системный обработчик недоступен: проверьте разрешение на ввод")
-                    .font(.system(size: 12)).foregroundStyle(model.shortcutReady ? Color.secondary : Color.orange)
             }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
@@ -1244,23 +1516,15 @@ struct SettingsView: View {
                 HStack { Text("Тихая речь"); Spacer(); Text("Шумная комната") }.font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Divider()
-            Text("Распознавание работает без интернета. Аудио обрабатывается в памяти и не сохраняется. Последние 100 фраз хранятся локально в ~/Library/Application Support/Golos/history.json. Whisper расставляет пунктуацию, но может ошибаться в словах и знаках.").font(.system(size: 12)).foregroundStyle(.secondary).textSelection(.enabled)
-            HStack {
-                Button("Доступ к вводу") { model.requestAccessibility() }
-                Button("Проверить доступ") { model.refreshPermissions() }
-                Spacer()
-                Button("Готово") { model.settings = false }.keyboardShortcut(.defaultAction)
-            }
-            Button(model.testingInsertion ? "Проверка запущена…" : "Проверить вставку через 6 секунд") { model.testInsertion() }
-                .disabled(model.testingInsertion || model.recording || model.pending > 0)
-            Button("Проверить потоковый ввод через 6 секунд") { model.testStreamingInsertion() }
-                .disabled(model.testingInsertion || model.recording || model.pending > 0)
+            Text("Работает без интернета. Аудио не сохраняется; последние 100 диктовок хранятся только на этом Mac. Ошибки в распознавании и пунктуации возможны.")
+                .font(.system(size: 12)).foregroundStyle(.secondary)
             Text("Голос \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")")
                 .font(.system(size: 11)).foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .onTapGesture(count: 3) { model.requestDeveloperOptions() }
-        }.padding(24)
-        }.frame(width: 560, height: 680)
+            }.padding(.horizontal, 24).padding(.bottom, 22)
+            }
+        }.frame(width: 560, height: 620)
         .sheet(isPresented: $model.developerPrompt, onDismiss: { model.developerPromptDismissed() }) {
             DeveloperPasswordView(model: model)
         }
@@ -1294,7 +1558,29 @@ struct DeveloperOptionsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             Text("Возможности разработчика").font(.system(size: 23, weight: .semibold))
-            ScrollView { VocabularySettingsView(model: model).padding(.vertical, 4) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VocabularySettingsView(model: model)
+                    Divider()
+                    DisclosureGroup("Диагностика") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Button("Доступ к вводу") { model.requestAccessibility() }
+                                Button("Проверить доступ") { model.refreshPermissions() }
+                            }
+                            Button(model.testingShortcut ? "Проверяю… Нажмите клавишу" : "Проверить клавишу (10 с)") { model.testShortcut() }
+                                .disabled(model.recording || model.testingShortcut)
+                            Text("Нажатий: \(model.shortcutHits)").font(.system(size: 12, design: .monospaced))
+                            Text(model.shortcutReady ? "Системный обработчик клавиши подключён" : "Системный обработчик недоступен")
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
+                            Button(model.testingInsertion ? "Проверка запущена…" : "Проверить вставку через 6 секунд") { model.testInsertion() }
+                                .disabled(model.testingInsertion || model.recording || model.pending > 0)
+                            Button("Проверить потоковый ввод через 6 секунд") { model.testStreamingInsertion() }
+                                .disabled(model.testingInsertion || model.recording || model.pending > 0)
+                        }.padding(.top, 8)
+                    }.font(.system(size: 13)).tint(accent)
+                }.padding(.vertical, 4)
+            }
             HStack { Spacer(); Button("Закрыть") { model.developerOptions = false }.keyboardShortcut(.defaultAction) }
         }.padding(24).frame(width: 560, height: 460)
     }
@@ -1384,7 +1670,8 @@ struct RecordingHUD: View {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private var instanceLease: InstanceLease?
     var window: NSWindow!
     var model: Model!
     var item: NSStatusItem!
@@ -1394,9 +1681,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var hud: NSPanel!
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        let launched = NSRunningApplication.current.launchDate ?? Date()
+        let other = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.okulovsky.golos")
+            .first { peer in
+                guard peer.processIdentifier != ProcessInfo.processInfo.processIdentifier, !peer.isTerminated else { return false }
+                let peerDate = peer.launchDate ?? Date.distantPast
+                return peerDate < launched || (peerDate == launched && peer.processIdentifier < ProcessInfo.processInfo.processIdentifier)
+            }
+        if let other {
+            other.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            NSApp.terminate(nil); return
+        }
+        do {
+            let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Golos", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            guard let lease = try InstanceLease.acquire(at: folder.appendingPathComponent("instance.lock")) else {
+                NSApp.terminate(nil); return
+            }
+            instanceLease = lease
+        } catch {
+            let alert = NSAlert(); alert.messageText = "Не удалось безопасно запустить Голос"
+            alert.informativeText = "Проверка единственного экземпляра не прошла. Микрофон не включён. \(error.localizedDescription)"
+            alert.runModal(); NSApp.terminate(nil); return
+        }
+        Diagnostics.log("app.started microphone=off")
         model = Model()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Голос"; window.center(); window.isReleasedWhenClosed = false
+        window.title = "Голос by Okulovsky"; window.center(); window.isReleasedWhenClosed = false; window.delegate = self
         window.contentView = NSHostingView(rootView: ContentView(model: model))
         window.minSize = NSSize(width: 740, height: 660)
         hud = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 268, height: 80), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -1445,14 +1756,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hud.orderFrontRegardless()
         } else { hud.orderOut(nil) }
     }
-    @objc func toggle() { model.toggle() }
+    @objc func toggle() { model.toggle(source: "menu") }
     @objc func showWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     @objc func preferences() { showWindow(); model.settings = true }
     @objc func quitApp() { NSApp.terminate(nil) }
+    func windowWillClose(_ notification: Notification) {
+        if let closing = notification.object as? NSWindow, closing === window { model?.stop(reason: "window_closed") }
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        model?.stop(reason: "quit")
+        Diagnostics.log("app.stopped microphone=off")
+    }
     func applicationDidBecomeActive(_ notification: Notification) { model?.refreshPermissions() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showWindow(); return true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model else { return .terminateNow }
         if model.recording || model.pending > 0 {
             let alert = NSAlert(); alert.messageText = "Завершить диктовку перед выходом?"
             alert.informativeText = "Нажмите «Остаться», остановите запись и дождитесь расшифровки последних фраз. При выходе незавершённые фразы будут потеряны."
@@ -1479,7 +1798,86 @@ if let index = CommandLine.arguments.firstIndex(of: "--render-panel"), CommandLi
     exit(0)
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--probe-instance"), CommandLine.arguments.count > index + 1 {
+    do {
+        guard let lease = try InstanceLease.acquire(at: URL(fileURLWithPath: CommandLine.arguments[index + 1])) else { exit(23) }
+        withExtendedLifetime(lease) { exit(0) }
+    } catch { exit(24) }
+}
+
 if CommandLine.arguments.contains("--self-test") {
+    let lockURL = FileManager.default.temporaryDirectory.appendingPathComponent("golos-lock-test-\(UUID().uuidString)")
+    do {
+        var first = try InstanceLease.acquire(at: lockURL)
+        precondition(first != nil)
+        func competingProcess() -> Int32 {
+            let child = Process(); child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+            child.arguments = ["--probe-instance", lockURL.path]
+            try! child.run(); child.waitUntilExit(); return child.terminationStatus
+        }
+        withExtendedLifetime(first) { precondition(competingProcess() == 23, "Second process must be refused") }
+        first = nil
+        precondition(competingProcess() == 0, "Lock must release when the owner exits")
+        try FileManager.default.removeItem(at: lockURL)
+    } catch { fatalError("Instance lock regression: \(error)") }
+    var grouped = HistorySessions()
+    let groupDate = Date(timeIntervalSince1970: 123)
+    let firstRecording = grouped.begin(date: groupDate), firstPart = UUID(), lastPart = UUID()
+    grouped.register(firstPart, in: firstRecording); grouped.register(lastPart, in: firstRecording)
+    grouped.confirm(firstPart) // Confirmation may precede the final ASR callback.
+    grouped.finish(firstPart, text: "First sentence.", delivered: false)
+    precondition(grouped.entry(firstRecording) == nil, "Pauses must not create history rows while recording")
+    grouped.end(firstRecording)
+    precondition(grouped.entry(firstRecording) == nil, "Wait for the last phrase recognized after Stop")
+    grouped.finish(lastPart, text: "Last sentence.", delivered: false)
+    precondition(grouped.entry(firstRecording)?.text == "First sentence. Last sentence.")
+    precondition(grouped.entry(firstRecording)?.date == groupDate && grouped.entry(firstRecording)?.id == firstRecording)
+    precondition(grouped.entry(firstRecording)?.delivered == false)
+    grouped.confirm(lastPart)
+    precondition(grouped.entry(firstRecording)?.delivered == true, "Delivery confirmation must update the entire recording")
+    grouped.finish(lastPart, text: "Last sentence.", delivered: true)
+    precondition(grouped.entry(firstRecording)?.text == "First sentence. Last sentence.", "Repeated final must not duplicate text")
+    let secondRecording = grouped.begin(), earlyPart = UUID(), latePart = UUID()
+    grouped.register(earlyPart, in: secondRecording); grouped.register(latePart, in: secondRecording)
+    grouped.finish(latePart, text: "Again.", delivered: true)
+    grouped.finish(earlyPart, text: "Again.", delivered: true)
+    grouped.end(secondRecording)
+    precondition(grouped.entry(secondRecording)?.text == "Again. Again.", "Keep capture order and intentional repetitions")
+    precondition(secondRecording != firstRecording && grouped.entry(firstRecording)?.text == "First sentence. Last sentence.", "A new invocation must be a separate record even in the same app")
+    let orderedRecording = grouped.begin(), orderedFirst = UUID(), orderedLast = UUID()
+    grouped.register(orderedFirst, in: orderedRecording); grouped.register(orderedLast, in: orderedRecording)
+    grouped.finish(orderedLast, text: "Second.", delivered: true)
+    grouped.finish(orderedFirst, text: "First.", delivered: true); grouped.end(orderedRecording)
+    precondition(grouped.entry(orderedRecording)?.text == "First. Second.", "Final callbacks must not reorder speech")
+    let silentRecording = grouped.begin(), discarded = UUID()
+    grouped.register(discarded, in: silentRecording); grouped.discard(discarded); grouped.end(silentRecording)
+    precondition(grouped.entry(silentRecording) == nil, "Silence must not create an empty row")
+    grouped.prune(preserving: [secondRecording])
+    precondition(grouped.confirm(firstPart) == nil && grouped.entry(firstRecording) == nil, "A late acknowledgement must not resurrect cleared history")
+    precondition(grouped.entry(secondRecording)?.text == "Again. Again.")
+    let legacyJSON = Data(#"{"id":"00000000-0000-0000-0000-000000000001","date":0,"text":"Legacy phrase","delivered":true}"#.utf8)
+    precondition(try! JSONDecoder().decode(Phrase.self, from: legacyJSON).text == "Legacy phrase")
+    var gate = CaptureGate()
+    let firstCapture = gate.begin(); precondition(gate.accepts(firstCapture))
+    gate.end(); precondition(!gate.accepts(firstCapture))
+    let secondCapture = gate.begin(); precondition(!gate.accepts(firstCapture) && gate.accepts(secondCapture))
+    gate.end(); precondition(!gate.accepts(secondCapture))
+    var mouseGesture = RightCommandGesture()
+    for (index, type) in [NSEvent.EventType.leftMouseDown, .rightMouseDown].enumerated() {
+        let mouse = NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: Double(index + 10), windowNumber: 0, context: nil, eventNumber: index, clickCount: 1, pressure: 1)!
+        precondition(!mouseGesture.observe(mouse)) // Real NSEvent: keyCode access here would throw.
+    }
+    var gesture = RightCommandGesture()
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: .command, timestamp: 1))
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: .command, timestamp: 1))
+    precondition(gesture.observe(type: .flagsChanged, code: 54, flags: [], timestamp: 1.1))
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: [], timestamp: 1.1))
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: [], timestamp: 2), "Release without press must not start recording")
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: .command, timestamp: 3))
+    precondition(!gesture.observe(type: .keyDown, code: 8, flags: .command, timestamp: 3.1))
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: [], timestamp: 3.2), "Command+C must not toggle")
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: .command, timestamp: 4))
+    precondition(!gesture.observe(type: .flagsChanged, code: 54, flags: [], timestamp: 6), "Long holds must not toggle")
     precondition(DeveloperPassword.derive("password", salt: Array("salt".utf8), rounds: 1)!.map { String(format: "%02x", $0) }.joined() == "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
     precondition(!DeveloperPassword.accepts("wrong") && !DeveloperPassword.accepts(""))
     if let password = ProcessInfo.processInfo.environment["GOLOS_TEST_DEVELOPER_PASSWORD"] { precondition(DeveloperPassword.accepts(password)) }
@@ -1508,6 +1906,15 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(InsertionPlan.rebase(expected: "Привет", actual: "Привет!", selection: CFRange(location: 6, length: 0), focusedCaret: CFRange(location: 7, length: 0))?.location == 7)
     precondition(InsertionPlan.rebase(expected: "Начало. Моя речь", actual: "Вступление. Начало. Моя речь", selection: CFRange(location: 15, length: 0), focusedCaret: nil)?.location == 27)
     precondition(InsertionPlan.rebase(expected: "Другой текст", actual: "Чужое содержание", selection: CFRange(location: 5, length: 0), focusedCaret: nil) == nil)
+    precondition(EditableFieldPolicy.accepts(role: kAXStaticTextRole, valueWritable: true), "Focused writable Qt message composer must be accepted")
+    precondition(!EditableFieldPolicy.accepts(role: kAXStaticTextRole, valueWritable: false), "Read-only text must not start capture")
+    precondition(!EditableFieldPolicy.accepts(role: kAXWindowRole, valueWritable: true), "Writable non-text containers are not editors")
+    precondition(EditableFieldPolicy.accepts(role: kAXTextAreaRole, valueWritable: false), "Editors accepting only paste must remain supported")
+    precondition(EditorTextPolicy.read(role: kAXStaticTextRole, value: "", rangeText: "Actual editor text") == "Actual editor text", "Qt range text must override its empty AXValue")
+    precondition(EditorTextPolicy.read(role: kAXStaticTextRole, value: "", rangeText: nil) == nil, "An unsupported range reader must not validate a frozen AXValue")
+    precondition(EditorTextPolicy.read(role: kAXTextAreaRole, value: "Document", rangeText: nil) == "Document")
+    precondition(DeliveryPolicy.choose(foreground: true, hasRange: false, selectedWritable: true, valueWritable: true, disabled: []) == .paste)
+    precondition(DeliveryPolicy.choose(foreground: false, hasRange: false, selectedWritable: true, valueWritable: true, disabled: []) == nil, "Opaque editors must buffer in the background without whole-value replacement")
     precondition(DeliveryPolicy.choose(foreground: true, hasRange: true, selectedWritable: true, valueWritable: true, disabled: []) == .paste)
     var rejected = Set<DeliveryMethod>()
     precondition(DeliveryPolicy.choose(foreground: false, hasRange: true, selectedWritable: true, valueWritable: true, disabled: rejected) == .selectedText)
@@ -1541,7 +1948,7 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(revised.offer("Я открываю вкладку и там", final: false).isEmpty)
     precondition(revised.offer("Я открываю вкладку и там печатаю", final: false) == "Я открываю вкладку и там")
     precondition(revised.offer("Совершенно иная фраза", final: true).isEmpty)
-    print("PASS: developer password, vocabulary priorities, canonical spellings, word boundaries, Russian roles, RU/EN cleanup, stable append-only streaming, hypothesis revisions, repeated finals, intentional repetitions, shortcut persistence")
+    print("PASS: one history entry per recording, late finalization and acknowledgements, legacy history compatibility, Qt text-range readback and opaque-editor delivery, writable Qt editor recognition, AppKit mouse-event regression, cross-process instance lock, recording buffer isolation, right Command tap/chord/duplicate handling, developer password, vocabulary priorities, canonical spellings, word boundaries, Russian roles, RU/EN cleanup, stable append-only streaming, hypothesis revisions, repeated finals, intentional repetitions, shortcut persistence")
     exit(0)
 }
 

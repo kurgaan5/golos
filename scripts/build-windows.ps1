@@ -16,7 +16,7 @@ cmake -S "$root/native" -B $build -A $platform @toolset "-DWHISPER_SOURCE=$sourc
 if ($LASTEXITCODE) { throw 'Native configuration failed' }
 cmake --build $build --config Release --parallel 4
 if ($LASTEXITCODE) { throw 'Native compilation failed' }
-$package=Join-Path $root "dist/Golos-1.7-Windows-$Arch"
+$package=Join-Path $root "dist/Golos-1.7.2-Windows-$Arch"
 dotnet publish "$root/windows/Golos.Windows/Golos.Windows.csproj" -c Release -r "win-$Arch" --self-contained true -p:PublishSingleFile=false -o $package
 if ($LASTEXITCODE) { throw 'Managed publish failed' }
 $nativeLibraries=Get-ChildItem $build -Filter '*.dll' -Recurse
@@ -35,7 +35,7 @@ if ($LASTEXITCODE) { throw 'Recognition tests failed' }
 $preview=Start-Process "$package/Golos.exe" -ArgumentList @('--render-ui',"`"$root/dist/Windows-$Arch.png`"") -PassThru -Wait
 if ($preview.ExitCode -ne 0) { throw 'UI smoke test failed' }
 Compress-Archive -Path $package -DestinationPath "$package.zip" -Force
-Get-FileHash "$package.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  Golos-1.7-Windows-$Arch.zip" } | Set-Content "$package.zip.sha256"
+Get-FileHash "$package.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  Golos-1.7.2-Windows-$Arch.zip" } | Set-Content "$package.zip.sha256"
 $compiler=Get-ChildItem "${env:ProgramFiles(x86)}/Inno Setup */ISCC.exe", "$env:ProgramFiles/Inno Setup */ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 if (!$compiler) {
   $installer=Join-Path $root '.build/innosetup.exe'
@@ -50,7 +50,7 @@ if (!$compiler) {
 }
 & $compiler "/DPackageDir=$package" "/DOutputDir=$root/dist" "/DTargetArch=$Arch" "$PSScriptRoot/windows-installer.iss"
 if ($LASTEXITCODE) { throw 'Installer compilation failed' }
-$setupFile=Join-Path $root "dist/Golos-1.7-Windows-$Arch-Setup.exe"
+$setupFile=Join-Path $root "dist/Golos-1.7.2-Windows-$Arch-Setup.exe"
 # Verify that a clean per-user installation contains the complete offline app.
 $smokeDir=Join-Path $root ".build/installed-$Arch"
 $install=Start-Process $setupFile -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"`"/DIR=$smokeDir`"") -PassThru -Wait

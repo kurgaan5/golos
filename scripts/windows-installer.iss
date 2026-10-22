@@ -8,7 +8,7 @@
 [Setup]
 AppId={{C44D6EF1-9037-46FB-8610-4A441F13934F}
 AppName=Голос
-AppVersion=1.7
+AppVersion=1.7.2
 AppPublisher=kurgaan5
 AppPublisherURL=https://github.com/kurgaan5/golos
 DefaultDirName={localappdata}\Programs\Golos
@@ -16,7 +16,7 @@ DefaultGroupName=Голос
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
-OutputBaseFilename=Golos-1.7-Windows-{#TargetArch}-Setup
+OutputBaseFilename=Golos-1.7.2-Windows-{#TargetArch}-Setup
 SetupIconFile=..\shared\Golos.ico
 UninstallDisplayIcon={app}\Golos.exe
 Compression=lzma2/fast
