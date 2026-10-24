@@ -1,0 +1,34 @@
+DictaNest 1.8.0 beta 1 — offline speech to text by Okulovsky
+
+Windows 10 2004+ x64, or Windows 11 ARM64 (use the matching package).
+Run Setup.exe to install into your own user account. No administrator account
+is required by this installer. The bundled models work without internet access.
+
+Launch DictaNest. In Windows Settings → Privacy & security → Microphone,
+allow desktop apps to use the microphone. Select a text field in another app,
+tap Right Ctrl once, dictate, and tap again to stop. Right Ctrl combinations
+remain available. The shortcut can be changed in Settings.
+
+The original input field stays pinned until you stop. If the editor cannot
+accept background input, return to the original field. An unconfirmed paste is
+not blindly repeated; Copy pending text and local history remain available.
+Do not run the target editor as administrator while DictaNest runs normally.
+
+Settings has independent interface and speech languages. Default speech language
+follows your Windows language on first launch; choose your main spoken language.
+Auto mode considers only your selected pair and locks its decision until stop.
+English names can remain in another language. No translation is requested.
+
+Audio is not saved. Last 100 dictations and settings are stored separately from
+Golos, under %LOCALAPPDATA%\DictaNest. The microphone starts only on explicit use
+and stops when recording ends, the window closes, the computer locks/sleeps, or
+there have been 3 minutes without speech.
+
+This is a test build, with no commercial signing certificate. Windows may show
+SmartScreen. Corporate policies may prevent installation or running it; this
+package does not bypass those policies. The model can make transcription errors.
+Technical Details and some exceptional messages are English.
+
+Before a stable public release, real microphone, hotkey, permissions and target
+editor checks are still required on the actual Windows computer. Automated tests
+and a CI screenshot do not establish compatibility with every editor.
