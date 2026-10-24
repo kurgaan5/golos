@@ -1,0 +1,49 @@
+name: Build DictaNest candidates
+on:
+  pull_request:
+    paths:
+      - 'International/**'
+      - '.github/workflows/dictanest-windows.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/download-artifact@v8
+        with:
+          name: dictanest-windows-${{ matrix.arch }}
+          run-id: 40077619783
+          github-token: ${{ github.token }}
+          path: International/.build/baseline
+      - name: Repack the UI with verified native libraries and models
+        shell: pwsh
+        run: ./International/scripts/repack-windows.ps1 -Arch '${{ matrix.arch }}'
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dictanest-windows-${{ matrix.arch }}
+          path: |
+            International/dist/*.zip
+            International/dist/*-Setup.exe
+            International/dist/*.sha256
+            International/dist/*.png
+          compression-level: 0
+          if-no-files-found: error
