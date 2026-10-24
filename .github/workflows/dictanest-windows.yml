@@ -6,6 +6,7 @@ on:
       - '.github/workflows/dictanest-windows.yml'
 permissions:
   contents: read
+  actions: read
 jobs:
   windows:
     strategy:
@@ -22,15 +23,20 @@ jobs:
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
-      - name: Build and verify international candidates
+      - uses: actions/download-artifact@v8
+        with:
+          name: dictanest-windows-${{ matrix.arch }}
+          run-id: 40077619783
+          github-token: ${{ github.token }}
+          path: International/.build/baseline
+      - name: Repack the UI with verified native libraries and models
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force International/tests/fixtures | Out-Null
-          Copy-Item tests/fixtures/mixed-test.wav, tests/fixtures/room-noise-test.wav International/tests/fixtures/
-          ./International/scripts/build-windows.ps1 -Arch '${{ matrix.arch }}'
+        run: ./International/scripts/repack-windows.ps1 -Arch '${{ matrix.arch }}'
       - uses: actions/upload-artifact@v6
         with:
           name: dictanest-windows-${{ matrix.arch }}

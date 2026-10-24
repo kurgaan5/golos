@@ -120,7 +120,7 @@ internal sealed class MainWindow : Form
         toggle.Click += async (_, _) => await Toggle(); toolbar.Controls.Add(toggle);
         var copyAll = MakeButton("copyAll"); copyAll.Click += (_, _) => { if (history.Count > 0) { Clipboard.SetText(string.Join(" ", history.Select(p => p.Text))); status.Text = "Text copied."; } }; toolbar.Controls.Add(copyAll);
         copyPending.Click += (_, _) => { var text = writer.TakePending(); if (text.Length > 0) Clipboard.SetText(text); UpdateUi(); }; toolbar.Controls.Add(copyPending);
-        var details=MakeButton("details");status.Visible=false;details.Click+=(_,_)=>status.Visible=!status.Visible;toolbar.Controls.Add(details);
+        var details=MakeButton("details");status.Visible=true;details.Click+=(_,_)=>status.Visible=!status.Visible;toolbar.Controls.Add(details);
         Controls.Add(transcript); Controls.Add(toolbar); Controls.Add(state); Controls.Add(accessPrompt); Controls.Add(top); Controls.Add(status);
         var menu = new ContextMenuStrip(); menu.Items.Add(L10n.Text("start"), null, async (_, _) => await Toggle()).Tag="start";
         menu.Items.Add(L10n.Text("open"), null, (_, _) => { Show(); Activate(); }).Tag="open";
@@ -151,6 +151,7 @@ internal sealed class MainWindow : Form
         FormClosing += (_, e) => { if (!exiting) { Stop(); e.Cancel = true; Hide(); } };
         FormClosed += (_, _) => { SystemEvents.PowerModeChanged -= PowerChanged; SystemEvents.SessionSwitch -= SessionChanged; timer.Dispose(); hotkey?.Dispose(); microphone?.Dispose(); activity?.Dispose(); hints.Dispose(); tray.Dispose(); hud.Dispose(); if (!decoding) engine?.Dispose(); };
         if (!preview) audioAccess = MicrophoneAccess.Check(false);
+        if(preview)status.Text=L10n.Text("fieldHint")+" · "+GlobalHotkey.Labels[Math.Clamp(prefs.Shortcut,0,3)];
         UpdateHistory(); ApplyLocalization();
     }
     void Ui(Action action) { if (!IsDisposed && IsHandleCreated) try { BeginInvoke(action); } catch (InvalidOperationException) { } }
