@@ -32,7 +32,7 @@ fi
 if [ "$ARCH" != x86_64 ]; then EXTRA_LIBS+=("$BUILD/ggml/src/ggml-metal/libggml-metal.a" "$BUILD/ggml/src/ggml-blas/libggml-blas.a"); fi
 xcrun swiftc -swift-version 5 "$SWIFT_OPT" -g -target "$ARCH-apple-macosx14.0" -module-cache-path "$BUILD/swift-cache" -import-objc-header "$SOURCE/WhisperBridge.h" "$SOURCE/main.swift" "$SOURCE/SpeechVocabulary.swift" "$SOURCE/DeveloperPassword.swift" "$BUILD/WhisperBridge.o" \
   "$BUILD/src/libwhisper.a" "$BUILD/ggml/src/libggml.a" "$BUILD/ggml/src/libggml-base.a" "${EXTRA_LIBS[@]}" \
-  -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework Accelerate -framework Metal -framework MetalKit -framework Foundation -lc++ -o "$APP/Contents/MacOS/Golos"
+  -framework AppKit -framework SwiftUI -framework AVFoundation -framework Carbon -framework ApplicationServices -framework ServiceManagement -framework Accelerate -framework Metal -framework MetalKit -framework Foundation -lc++ -o "$APP/Contents/MacOS/Golos"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 "$APP/Contents/MacOS/Golos" --self-test
@@ -49,7 +49,9 @@ test -z "$NOISE_OUTPUT"
 test "$("$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/mixed-test.wav" --activity-only)" = SPEECH
 test "$("$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/room-noise-test.wav" --activity-only)" = SILENCE
 cp "$ROOT/MACOS.txt" "$ROOT/dist/Как пользоваться.txt"
-NAME="Golos-1.7.3-macOS-$ARCH.zip"
+PACKAGE_ARCH="$ARCH"
+if [ "$ARCH" = arm64 ]; then PACKAGE_ARCH=AppleSilicon; fi
+NAME="Golos-1.7.7-macOS-$PACKAGE_ARCH.zip"
 ditto -c -k --keepParent "$APP" "$ROOT/dist/$NAME"
 (cd "$ROOT/dist" && shasum -a 256 "$NAME" > "$NAME.sha256")
 STAGE="$BUILD/dmg"
@@ -57,7 +59,7 @@ mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/Голос.app"
 ln -sfn /Applications "$STAGE/Программы"
 cp "$ROOT/MACOS.txt" "$STAGE/Как установить.txt"
-DMG="Golos-1.7.3-macOS-$ARCH.dmg"
+DMG="Golos-1.7.7-macOS-$PACKAGE_ARCH.dmg"
 hdiutil create -fs HFS+ -volname "Голос" -srcfolder "$STAGE" -format UDZO -ov "$ROOT/dist/$DMG"
 hdiutil verify "$ROOT/dist/$DMG"
 (cd "$ROOT/dist" && shasum -a 256 "$DMG" > "$DMG.sha256")
