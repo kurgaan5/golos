@@ -36,7 +36,6 @@ public sealed class StableTranscript
     public string Committed { get; private set; } = "";
     string previous = "";
     bool finished;
-    int stalled;
     public string Offer(string hypothesis, bool final)
     {
         if (finished) return "";
@@ -52,14 +51,15 @@ public sealed class StableTranscript
                 for (int ci = Math.Max(0, oi - 3); ci <= Math.Min(current.Length - 3, oi + 3); ci++)
                     if (old[oi].Key == current[ci].Key && old[oi + 1].Key == current[ci + 1].Key) agreement = Math.Max(agreement, ci + 2);
             int stable = Math.Min(agreement, Math.Max(0, current.Length - 1));
-            if (stalled >= 2 && current.Length >= 4) stable = Math.Max(stable, current.Length - 2);
-            previous = text; stalled++;
+            // Elapsed disagreement is not evidence that the newest words were
+            // spoken. Wait for actual local agreement, as on macOS 1.7.7.
+            previous = text;
             if (stable == 0) return "";
             candidate = text[..current[stable].Start].Trim().TrimEnd('.', '!', '?', '…');
         }
         else finished = true;
         if (candidate.Length == 0) return "";
-        if (Committed.Length == 0) { Committed = candidate; stalled = 0; return candidate; }
+        if (Committed.Length == 0) { Committed = candidate; return candidate; }
         var ledger = Words(Committed); var proposed = Words(candidate);
         if (ledger.Length == 0 || proposed.Length == 0) return "";
         int? end = null;
@@ -85,7 +85,7 @@ public sealed class StableTranscript
         else if (trailing.Any(c => !char.IsWhiteSpace(c))) tail = new string(tail.SkipWhile(c => !char.IsLetterOrDigit(c) && !char.IsWhiteSpace(c)).ToArray());
         tail = Balanced(Committed, tail);
         if (tail.Length == 0) return "";
-        Committed += tail; stalled = 0; return tail;
+        Committed += tail; return tail;
     }
     static string Balanced(string prefix, string tail)
     {

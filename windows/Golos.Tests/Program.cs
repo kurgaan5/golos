@@ -24,6 +24,145 @@ Check(Stream("Привет", "Привет мир", "Привет мир сег�
 Check(Stream("Очень", "Очень очень", "Очень очень важно", "Очень очень важно.") == "Очень очень важно.", "Intentional repetitions");
 Check(Stream("Сегодня обсуждаем product", "Сегодня обсуждаем product roadmap", "Сегодня обсуждаем product roadmap и user research.") == "Сегодня обсуждаем product roadmap и user research.", "Mixed speech");
 Check(Stream("Сегодня обсуждаем roadmap VK Play Cloud и ChatGPT.", "Сегодня обсуждаем roadmap VK Play Cloud и ChatGPT. Исследователи-дизайнер проверяют гипотезу.", "Сегодня обсуждаем roadmap VK Play Cloud и ChatGPT. Исследователи-дизайнер проверяют гипотезу.", "Сегодня обсуждаем roadmap VK Play Cloud и ChatGPT. Исследователи дизайнер проверяют гипотезу.") == "Сегодня обсуждаем roadmap VK Play Cloud и ChatGPT. Исследователи-дизайнер проверяют гипотезу.", "Compound revision");
+// Incident replay: unrelated partials cannot become confirmed just because a
+// few earlier hypotheses disagreed. The former stalled fallback emitted here.
+var disagreement = new StableTranscript();
+foreach (string hypothesis in new[]
+{
+    "Сегодня проверяется первая неизвестная гипотеза",
+    "Завтра обсуждают вторую отдельную версию",
+    "Позавчера возникла третья совершенно иная мысль",
+    "Утром принесли четвертое независимое объяснение"
+}) Check(disagreement.Offer(hypothesis, false) == "" && disagreement.Committed == "", "Disagreement is not confirmation");
+Check(disagreement.Offer("Вот настоящая короткая фраза.", true) == "Вот настоящая короткая фраза.", "Final after contradictory partials contains only actual final");
+
+string decoderLoop = "Ищите " + string.Join(", ", Enumerable.Repeat("качайте", 54));
+Check(RecognitionPolicy.Rejection(decoderLoop, 2.2798125) == "word_rate", "Reject incident 55 words from 2.28 seconds");
+Check(RecognitionPolicy.Rejection(string.Join(' ', Enumerable.Repeat("проверяйте загрузки", 8)), 12) == "repetition_loop", "Reject a long consecutive multiword cycle");
+Check(RecognitionPolicy.Rejection(string.Join(' ', Enumerable.Range(0, 55).Select(i => "слово" + i)), 2.28) == "word_rate", "Reject impossible rate without repetition");
+Check(RecognitionPolicy.Rejection(string.Join(' ', Enumerable.Range(0, 55).Select(i => "слово" + i)), 12) == null, "Allow normal long speech rather than limiting sentence length");
+Check(RecognitionPolicy.Rejection("Да да да да. Очень очень важно. Product roadmap и user research.", 4) == null, "Preserve short intentional emphasis and RU/EN terms");
+foreach (string caption in new[] { "НАПРЯЖЕННАЯ МУЗЫКА", "НАПРЯЖЁННАЯ МУЗЫКА!", "АПЛОДИСМЕНТЫ…", "ШУМ." })
+    Check(RecognitionPolicy.Rejection(caption, 4) == "sound_caption", "Reject isolated decoder sound caption");
+Check(RecognitionPolicy.Rejection("В фильме играет напряжённая музыка.", 4) == null, "Do not reject actual discussion of music");
+Check(RecognitionPolicy.Rejection("", 1) == null, "Silence remains empty rather than becoming text");
+
+var guardedLedger = new StableTranscript();
+_ = guardedLedger.Offer("Сегодня обсуждаем product roadmap", false);
+_ = guardedLedger.Offer("Сегодня обсуждаем product roadmap и user research", false);
+string confirmedBeforeReject = guardedLedger.Committed;
+Check(confirmedBeforeReject.Length > 0, "Replay has a real locally confirmed prefix");
+var rejectedHistory = new HistorySessions(); var rejectedCapture = rejectedHistory.Begin(); var rejectedSegment = Guid.NewGuid();
+Check(rejectedHistory.Register(rejectedCapture, rejectedSegment), "Register rejected-final history replay");
+rejectedHistory.End(rejectedCapture);
+bool rejectedFinal = false;
+try
+{
+    RecognitionPolicy.Validate(decoderLoop, 2.2798125); // Same entry point used by NativeRecognizer.
+    _ = guardedLedger.Offer(decoderLoop, true);
+    rejectedHistory.Finish(rejectedSegment, decoderLoop);
+}
+catch (UnreliableRecognitionException error)
+{
+    Check(error.Reason == "word_rate", "Explicit rejection preserves machine-readable reason");
+    rejectedFinal = true;
+    rejectedHistory.Finish(rejectedSegment, guardedLedger.Committed);
+}
+Check(rejectedFinal && guardedLedger.Committed == confirmedBeforeReject, "Rejected final cannot poison confirmed streaming ledger");
+Check(rejectedHistory.Entry(rejectedCapture)?.Text == confirmedBeforeReject, "Rejected final history retains only the earlier confirmed prefix");
+
+var rejectedPartial = new StableTranscript();
+_ = rejectedPartial.Offer("Ищите", false);
+try { RecognitionPolicy.Validate(decoderLoop, 2.2798125); _ = rejectedPartial.Offer(decoderLoop, false); }
+catch (UnreliableRecognitionException) { }
+Check(rejectedPartial.Committed == "" && rejectedPartial.Offer("Вот настоящая речь.", true) == "Вот настоящая речь.", "Rejected partial cannot contaminate a later valid final");
+
+// Dispatch/readback race replay using the same ledger used by the native UIA
+// writer. These tests do not claim the native input APIs have been exercised.
+{
+    const string baseline = "Черновик", firstDelta = " первая часть", newerDelta = " и продолжение";
+    string desired = baseline + firstDelta;
+    var delivery = new DeliveryLedger(); delivery.Append(firstDelta);
+    Guid attempt = delivery.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Unicode, 0);
+    delivery.Append(newerDelta);
+    for (int i = 1; i <= 8; i++)
+        Check(delivery.Observe(attempt, null, false, false, i) == ReceiptDecision.Waiting, "Hidden/read-unavailable receipt keeps all pending text");
+    Check(delivery.Pending == firstDelta + newerDelta && delivery.InFlight?.Baseline == baseline && delivery.InFlight?.Desired == desired,
+        "Navigation does not erase immutable dispatch metadata or its newer tail");
+    Check(delivery.Observe(attempt, desired, true, false, 8.2) == ReceiptDecision.Waiting, "Hidden cached success cannot settle a suspended direct receipt");
+    Check(delivery.Observe(attempt, desired, true, true, 9) == ReceiptDecision.Confirmed, "Return acknowledges the already inserted prefix without replay");
+    Check(delivery.Pending == newerDelta && delivery.InFlight == null && !delivery.Uncertain, "Only the acknowledged prefix is removed");
+    var next = delivery.Begin(newerDelta, desired, desired + newerDelta, desired.Length, 0, DeliveryKind.Unicode, 9);
+    Check(delivery.Observe(next, desired + newerDelta, true, true, 9.2) == ReceiptDecision.Confirmed && delivery.Pending == "", "Newer tail can continue after reconciliation");
+
+    var unchanged = new DeliveryLedger(); unchanged.Append(firstDelta);
+    var missed = unchanged.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Unicode, 0);
+    Check(unchanged.Observe(missed, null, false, false, .2) == ReceiptDecision.Waiting, "Missed send becomes suspended");
+    Check(unchanged.Observe(missed, baseline, true, true, 1) == ReceiptDecision.Waiting, "One unchanged live read is insufficient");
+    Check(unchanged.Observe(missed, null, true, true, 1.1) == ReceiptDecision.Waiting, "Readability loss resets retry evidence");
+    Check(unchanged.Observe(missed, baseline, true, true, 1.2) == ReceiptDecision.Waiting, "First new unchanged read is insufficient");
+    Check(unchanged.Observe(missed, baseline, true, true, 1.2) == ReceiptDecision.Waiting, "The same observation timestamp is not a second read");
+    var interrupted = unchanged.InFlight!;
+    Check(unchanged.Observe(missed, baseline, true, true, 1.4) == ReceiptDecision.RetrySafe && interrupted.Interrupted,
+        "Two distinct unchanged original reads permit a same-method retry after departure");
+    Check(unchanged.Pending == firstDelta && unchanged.InFlight == null && !unchanged.Uncertain, "No-effect retry never retires unsent words");
+
+    var transformed = new DeliveryLedger(); transformed.Append(firstDelta + newerDelta);
+    var altered = transformed.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Clipboard, 0);
+    string edited = baseline + "первая часть. Ручная правка";
+    Check(transformed.Observe(altered, edited, true, true, 1) == ReceiptDecision.Ambiguous, "Positive transformation is terminal for one attempt, not an eternal lock");
+    Check(transformed.Pending == newerDelta && transformed.Uncertain && transformed.NeedsFreshCaret && transformed.InFlight == null,
+        "Ambiguity preserves newer words and requires a new original-field caret");
+    transformed.EstablishFreshCaret();
+    var continued = transformed.Begin(newerDelta, edited, edited + newerDelta, edited.Length, 0, DeliveryKind.Unicode, 1);
+    Check(transformed.Observe(continued, edited + newerDelta, true, true, 1.2) == ReceiptDecision.Confirmed && transformed.Uncertain,
+        "A later successful delta cannot falsely confirm earlier ambiguous words");
+
+    var cancelled = new DeliveryLedger(); cancelled.Append(firstDelta);
+    var stale = cancelled.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Unicode, 0);
+    Check(cancelled.TakePending() == firstDelta, "Manual copy gets the whole unacknowledged prefix and cancels delivery");
+    cancelled.Append("Новый текст");
+    var fresh = cancelled.Begin("Новый текст", "", "Новый текст", 0, 0, DeliveryKind.Unicode, 1);
+    Check(cancelled.Observe(stale, desired, true, true, 2) == ReceiptDecision.Stale && cancelled.Contains(fresh) && cancelled.Pending == "Новый текст",
+        "A cancelled callback cannot drain another invocation");
+
+    var background = new DeliveryLedger(); background.Append(firstDelta);
+    var backgroundId = background.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Value, 0);
+    Check(background.Observe(backgroundId, desired, true, false, .1) == ReceiptDecision.Waiting, "One UIA setter/read is not durable confirmation");
+    Check(background.Observe(backgroundId, desired, true, false, .3) == ReceiptDecision.Waiting, "A throttled controlled editor may revert after 450ms");
+    Check(background.Observe(backgroundId, desired, true, false, .5) == ReceiptDecision.Waiting, "Several fast cached reads still cannot confirm persistence");
+    Check(background.Observe(backgroundId, desired, true, false, 1.3) == ReceiptDecision.Confirmed, "A background write requires multiple reads across more than one second");
+    // Simulate a native ValuePattern adapter that accepts SetValue but resets
+    // its reported selection to zero. Later deltas must still append in order.
+    var setterAttempt = new DeliveryAttempt(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Value, 0);
+    var setterPosition = setterAttempt.NextPosition(0, 0, false, desired.Length);
+    Check(setterPosition.Cursor == desired.Length && setterPosition.Selection == 0, "Setter-induced caret reset is not a request to prepend the next delta");
+    string secondWrite = desired[..setterPosition.Cursor!.Value] + newerDelta + desired[setterPosition.Cursor.Value..];
+    Check(secondWrite == desired + newerDelta, "Two background deltas retain natural order after a native caret reset");
+    var directAttempt = new DeliveryAttempt(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Unicode, 0);
+    Check(directAttempt.NextPosition(2, 0, true, desired.Length).Cursor == 2, "Foreground direct delivery respects a manually moved live caret");
+    var reverted = new DeliveryLedger(); reverted.Append(firstDelta);
+    var revertingId = reverted.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Value, 0);
+    _ = reverted.Observe(revertingId, desired, true, false, .1);
+    Check(reverted.Observe(revertingId, baseline, true, false, 1.2) == ReceiptDecision.Waiting && reverted.Pending == firstDelta,
+        "A reverted background setter keeps its original prefix for a foreground retry");
+
+    var terminator = new DeliveryLedger(); terminator.Append(firstDelta);
+    var terminalId = terminator.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Unicode, 0);
+    Check(terminator.Observe(terminalId, desired + "\r\n", true, true, .2) == ReceiptDecision.Confirmed, "One Windows document terminator is harmless");
+    var internalEdit = new DeliveryLedger(); internalEdit.Append(firstDelta);
+    var internalId = internalEdit.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Unicode, 0);
+    Check(internalEdit.Observe(internalId, desired.Replace(" ", "\r\n"), true, true, 1) == ReceiptDecision.Ambiguous, "Interior newline changes are never normalized away");
+    var opaque = new DeliveryLedger(); opaque.Append(firstDelta);
+    var opaqueId = opaque.Begin(firstDelta, null, null, null, 0, DeliveryKind.Unicode, 0);
+    Check(opaque.Observe(opaqueId, null, true, true, .2) == ReceiptDecision.SentUnobservable && opaque.Pending == "" && opaque.Uncertain,
+        "Opaque clients remain send-once without an impossible receipt lock");
+    var wrongField = new DeliveryLedger(); wrongField.Append(firstDelta);
+    var wrongId = wrongField.Begin(firstDelta, baseline, desired, baseline.Length, 0, DeliveryKind.Unicode, 0);
+    Check(wrongField.Observe(wrongId, desired, false, true, 1) == ReceiptDecision.Waiting && wrongField.Pending == firstDelta,
+        "Even identical text in an unproved destination cannot acknowledge or redirect a receipt");
+}
+
 var vocabulary = new Vocabulary("OneBrain\nVK Play\nOneBrain, Figma; My Project");
 Check(vocabulary.Custom.Length == 4 && vocabulary.Terms.Count(t => t == "VK Play") == 1, "Vocabulary priorities");
 Check(vocabulary.Canonicalize("Продакт: product road map VK PLAY CLOUD и chatgpt.") == "Продакт: product roadmap VK Play Cloud и ChatGPT.", "Canonical spelling");
@@ -65,7 +204,7 @@ segmenter.Snapshot += (_, s, f) => snapshots.Add((s.Length, f));
 for (int i = 0; i < 25; i++) segmenter.Accept(Enumerable.Repeat(0.1f, 800).ToArray());
 for (int i = 0; i < 24; i++) segmenter.Accept(new float[800]);
 Check(snapshots.Any(s => !s.Final) && snapshots.Count(s => s.Final) == 1, "Streaming and silence boundary");
-Console.WriteLine("PASS: complete dictation history, late finalization, ordering, capture isolation, stable streaming, revisions, vocabulary, Russian roles, audio segmentation");
+Console.WriteLine("PASS: unconfirmed hypothesis isolation, decoder-loop/word-rate/caption guards, rejected-final history preservation, complete dictation history, late finalization, ordering, capture isolation, stable streaming, revisions, vocabulary, Russian roles, audio segmentation");
 if (args.Length > 0)
 {
     using var recognizer = new NativeRecognizer(args[0]);

@@ -32,13 +32,13 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
         using var mutex = new Mutex(true, @"Local\GolosDictation", out bool first);
-        if (!first) { MessageBox.Show("Голос уже работает. Откройте его через значок в строке задач.", "Голос"); return; }
+        if (!first) { if (!args.Contains("--background")) MessageBox.Show("Голос уже работает. Откройте его через значок в строке задач.", "Голос"); return; }
         if (args.Length == 2 && args[0] == "--render-ui")
         {
             using var preview = new MainWindow(preview: true); preview.Show(); Application.DoEvents();
             using var bitmap = new Bitmap(preview.Width, preview.Height); preview.DrawToBitmap(bitmap, preview.ClientRectangle); bitmap.Save(args[1]); return;
         }
-        Application.Run(new MainWindow());
+        Application.Run(new MainWindow(background: args.Contains("--background")));
     }
 }
 
@@ -76,11 +76,11 @@ internal sealed class MainWindow : Form
     readonly List<Job> jobs = new();
     readonly object audioLock = new();
     readonly SemaphoreSlim nativeLock = new(1, 1);
-    readonly bool preview;
+    readonly bool preview, backgroundLaunch;
+    bool initialShowHandled, modelLoadStarted;
     NativeRecognizer? engine;
     NativeActivityDetector? activity;
     readonly SpeechInactivity inactivity = new();
-    bool autoStoppedForSilence;
     readonly ToolTip hints = new();
     static double MonotonicTime => (double)Stopwatch.GetTimestamp() / Stopwatch.Frequency;
     WaveInEvent? microphone;
@@ -97,9 +97,9 @@ internal sealed class MainWindow : Form
     sealed record Job(Guid Id, float[] Audio, bool Final, Vocabulary Vocabulary);
     static readonly Color Accent = Color.FromArgb(20, 96, 232);
     internal static Button MakeButton(string text) => new() { Text = text, AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(8, 4, 8, 4), BackColor = Color.White };
-    public MainWindow(bool preview = false)
+    public MainWindow(bool preview = false, bool background = false)
     {
-        this.preview = preview;
+        this.preview = preview; backgroundLaunch = background && !preview;
         Text = "Голос by Okulovsky"; Font = new Font("Segoe UI", 10); Size = new Size(800, 690); MinimumSize = new Size(680, 520);
         StartPosition = FormStartPosition.CenterScreen; BackColor = Color.FromArgb(245, 248, 253); Padding = new Padding(24);
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 76, WrapContents = false };
@@ -139,7 +139,6 @@ internal sealed class MainWindow : Form
                 }
                 finally { tickBusy = false; }
             }; timer.Start();
-            Shown += async (_, _) => await LoadModel();
             SystemEvents.PowerModeChanged += PowerChanged;
             SystemEvents.SessionSwitch += SessionChanged;
         }
@@ -147,6 +146,27 @@ internal sealed class MainWindow : Form
         FormClosed += (_, _) => { SystemEvents.PowerModeChanged -= PowerChanged; SystemEvents.SessionSwitch -= SessionChanged; timer.Dispose(); hotkey?.Dispose(); microphone?.Dispose(); activity?.Dispose(); hints.Dispose(); tray.Dispose(); hud.Dispose(); if (!decoding) engine?.Dispose(); };
         if (!preview) audioAccess = MicrophoneAccess.Check(false);
         UpdateHistory(); UpdateUi();
+    }
+    protected override void SetVisibleCore(bool value)
+    {
+        if (value && backgroundLaunch && !initialShowHandled)
+        {
+            initialShowHandled = true;
+            // Application.Run still needs a native handle/message loop. The
+            // first startup show is suppressed; tray actions can show it later.
+            if (!IsHandleCreated) CreateHandle();
+            base.SetVisibleCore(false); return;
+        }
+        base.SetVisibleCore(value);
+    }
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (!preview && !modelLoadStarted)
+        {
+            modelLoadStarted = true;
+            BeginInvoke((Action)(async () => await LoadModel()));
+        }
     }
     void Ui(Action action) { if (!IsDisposed && IsHandleCreated) try { BeginInvoke(action); } catch (InvalidOperationException) { } }
     void PowerChanged(object sender, PowerModeChangedEventArgs e) { if (e.Mode == PowerModes.Suspend) Ui(Stop); }
@@ -198,7 +218,7 @@ internal sealed class MainWindow : Form
                 catch (Exception error) { Ui(() => { if (ReferenceEquals(microphone, currentMicrophone)) { Stop(); status.Text = error.Message; } }); }
             };
             currentMicrophone.RecordingStopped += (_, e) => { if (e.Exception != null) Ui(() => { if (ReferenceEquals(microphone, currentMicrophone)) { Stop(); captureConfirmed = false; audioAccess = MicrophoneAccess.Check(false); status.Text = "Микрофон недоступен: " + e.Exception.Message; UpdateUi(); } }); };
-            autoStoppedForSilence = false; recording = true; currentMicrophone.StartRecording(); captureConfirmed = true; audioAccess = AudioAccessState.Granted;
+            recording = true; currentMicrophone.StartRecording(); captureConfirmed = true; audioAccess = AudioAccessState.Granted;
             status.Text = "Слушаю для «" + writer.Destination + "». Поле закреплено до остановки.";
         }
         catch (Exception e)
@@ -219,7 +239,6 @@ internal sealed class MainWindow : Form
         if (!recording) return;
         var recordingId = captureHistoryId; closingCapture = true;
         lock (audioLock) { recording = false; captureGate.End(); inactivity.End(); segmenter?.Flush(); activity?.Dispose(); activity = null; }
-        autoStoppedForSilence = silence;
         microphone?.StopRecording();
         microphone?.Dispose(); microphone = null;
         // Snapshot callbacks were queued under audioLock; close behind them.
@@ -248,10 +267,16 @@ internal sealed class MainWindow : Form
                 await nativeLock.WaitAsync();
                 string text;
                 try { text = await Task.Run(() => engine.Transcribe(job.Audio, job.Final, job.Vocabulary)); }
+                catch (UnreliableRecognitionException)
+                {
+                    status.Text = "Сомнительный фрагмент пропущен. Уже подтверждённые слова сохранены.";
+                    PreserveConfirmedFinal(job);
+                    UpdateUi(); continue;
+                }
                 catch (Exception e)
                 {
                     status.Text = e.Message;
-                    if (job.Final) { if (historySessions.Finish(job.Id, "") is Guid failed) PublishHistory(failed); ledgers.Remove(job.Id); }
+                    PreserveConfirmedFinal(job);
                     continue;
                 }
                 finally { nativeLock.Release(); }
@@ -268,6 +293,13 @@ internal sealed class MainWindow : Form
         }
         catch (Exception e) { status.Text = e.Message; }
         finally { decoding = false; UpdateUi(); if (jobs.Count > 0 && !exiting) _ = DecodeNext(); }
+    }
+    void PreserveConfirmedFinal(Job job)
+    {
+        if (!job.Final) return;
+        string confirmed = ledgers.TryGetValue(job.Id, out var partial) ? partial.Committed : "";
+        if (historySessions.Finish(job.Id, confirmed) is Guid id) PublishHistory(id);
+        ledgers.Remove(job.Id);
     }
     void PublishHistory(Guid id)
     {
@@ -290,8 +322,8 @@ internal sealed class MainWindow : Form
         state.Text = recording ? "Слушаю вас" : engine == null && !preview ? "Загружаю модель…" : decoding ? "Микрофон выключен · завершаю распознавание…" : "Микрофон выключен";
         copyPending.Enabled = writer.PendingCharacters > 0 && !writer.Busy && !recording && !decoding;
         if (writer.PendingCharacters > 0) status.Text = writer.Status + " Ожидает символов: " + writer.PendingCharacters;
-        bool show = prefs.ShowPanel && !autoStoppedForSilence && (recording || decoding || writer.PendingCharacters > 0);
-        if (show) { hud.UpdateText(recording ? "●  Слушаю · " + writer.Destination : decoding ? "Обрабатываю речь…" : "Текст ждёт вставки · " + writer.PendingCharacters); if (!hud.Visible) hud.Show(); }
+        bool show = prefs.ShowPanel && recording;
+        if (show) { hud.UpdateText("●  Слушаю · " + writer.Destination); if (!hud.Visible) hud.Show(); }
         else hud.Hide();
     }
     void ExitApp()
@@ -318,6 +350,36 @@ internal sealed class MainWindow : Form
         var checkAudio = MakeButton("Проверить"); checkAudio.Click += (_, _) => CheckAudioAccess(); audioActions.Controls.Add(checkAudio);
         var audioSettings = MakeButton("Настройки Windows"); audioSettings.Click += (_, _) => OpenMicrophoneSettings(); audioActions.Controls.Add(audioSettings);
         box.Controls.Add(audioActions);
+        var startup = new CheckBox { Text = "Запускать при входе в Windows", AutoSize = true };
+        var startupStatus = new Label { AutoSize = true, MaximumSize = new Size(440, 0), ForeColor = Color.DimGray };
+        bool refreshingStartup = false;
+        void RefreshStartup()
+        {
+            var value = LoginStartup.Check(); refreshingStartup = true;
+            startup.Checked = value.Enabled;
+            refreshingStartup = false;
+            startupStatus.Text = value.Error != null ? "Не удалось проверить автозапуск: " + value.Error
+                : value.DisabledByWindows ? "Автозапуск отключён в Windows. Включить его можно в разделе «Автозагрузка приложений»."
+                : value.ApprovalUnknown ? "Запись автозапуска проверена; её состояние дополнительно проверьте в Windows."
+                : value.Enabled ? "Голос будет готов к клавише после загрузки модели. Микрофон останется выключенным."
+                : "При входе в Windows Голос не запускается.";
+        }
+        startup.CheckedChanged += (_, _) =>
+        {
+            if (refreshingStartup) return;
+            try { LoginStartup.Set(startup.Checked); }
+            catch (Exception e) { status.Text = "Не удалось изменить автозапуск: " + e.Message; }
+            RefreshStartup();
+        };
+        RefreshStartup(); box.Controls.Add(startup); box.Controls.Add(startupStatus);
+        var startupSettings = MakeButton("Автозагрузка Windows");
+        startupSettings.Click += (_, _) =>
+        {
+            try { LoginStartup.OpenSettings(); }
+            catch (Exception e) { status.Text = "Откройте Параметры Windows → Приложения → Автозагрузка. " + e.Message; }
+        };
+        box.Controls.Add(startupSettings);
+        dialog.Activated += (_, _) => RefreshStartup();
         var panel = new CheckBox { Text = "Показывать панель диктовки", Checked = prefs.ShowPanel, AutoSize = true };
         panel.CheckedChanged += (_, _) => { prefs.ShowPanel = panel.Checked; SavePrefs(); UpdateUi(); }; box.Controls.Add(panel);
         box.Controls.Add(new Label { Text = "Начать / остановить", AutoSize = true, Margin = new Padding(0, 15, 0, 5) });
@@ -325,7 +387,7 @@ internal sealed class MainWindow : Form
         keys.SelectedIndexChanged += (_, _) => { prefs.Shortcut = keys.SelectedIndex; if (hotkey != null) hotkey.Preset = prefs.Shortcut; SavePrefs(); }; box.Controls.Add(keys);
         box.Controls.Add(new Label { Text = "Основной язык — русский. Поле закреплено на всю запись.\nДля нового поля остановите и запустите диктовку заново.\nАудио не сохраняется и не отправляется в интернет.", AutoSize = true, Margin = new Padding(0, 18, 0, 10) });
         box.Controls.Add(new Label { Text = "После 3 минут без речи микрофон выключается.\nПока вы говорите, отсчёт сбрасывается.", AutoSize = true, Margin = new Padding(0, 5, 0, 10) });
-        var version = new Label { Text = "Голос 1.7.3", AutoSize = true, ForeColor = Color.Gray, Margin = new Padding(0, 18, 0, 0) };
+        var version = new Label { Text = "Голос " + Application.ProductVersion.Split('+')[0], AutoSize = true, ForeColor = Color.Gray, Margin = new Padding(0, 18, 0, 0) };
         long clicked = 0; int count = 0;
         version.MouseDown += (_, _) => { long now = Environment.TickCount64; count = now - clicked < 1200 ? count + 1 : 1; clicked = now; if (count == 3) { count = 0; DeveloperAccess(dialog); } }; box.Controls.Add(version);
         dialog.Controls.Add(box); dialog.ShowDialog(this);

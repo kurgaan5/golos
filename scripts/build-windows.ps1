@@ -1,4 +1,7 @@
-param([ValidateSet('x64','arm64')][string]$Arch='x64')
+param(
+  [ValidateSet('x64','arm64')][string]$Arch='x64',
+  [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version='1.7.8'
+)
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
 $build=Join-Path $root ".build/windows-$Arch"
@@ -16,8 +19,8 @@ cmake -S "$root/native" -B $build -A $platform @toolset "-DWHISPER_SOURCE=$sourc
 if ($LASTEXITCODE) { throw 'Native configuration failed' }
 cmake --build $build --config Release --parallel 4
 if ($LASTEXITCODE) { throw 'Native compilation failed' }
-$package=Join-Path $root "dist/Golos-1.7.3-Windows-$Arch"
-dotnet publish "$root/windows/Golos.Windows/Golos.Windows.csproj" -c Release -r "win-$Arch" --self-contained true -p:PublishSingleFile=false -o $package
+$package=Join-Path $root "dist/Golos-$Version-Windows-$Arch"
+dotnet publish "$root/windows/Golos.Windows/Golos.Windows.csproj" -c Release -r "win-$Arch" --self-contained true -p:PublishSingleFile=false "-p:Version=$Version" -o $package
 if ($LASTEXITCODE) { throw 'Managed publish failed' }
 $nativeLibraries=Get-ChildItem $build -Filter '*.dll' -Recurse
 if (!$nativeLibraries -or !($nativeLibraries.Name -contains 'golos_native.dll')) { throw 'Native DLLs missing' }
@@ -27,7 +30,7 @@ Copy-Item "$root/licenses" $package -Recurse -Force
 python "$PSScriptRoot/fetch-models.py" "$package/Resources"
 if ($LASTEXITCODE) { throw 'Model verification failed' }
 $tests=Join-Path $root ".build/tests-$Arch"
-dotnet publish "$root/windows/Golos.Tests/Golos.Tests.csproj" -c Release -r "win-$Arch" --self-contained true -o $tests
+dotnet publish "$root/windows/Golos.Tests/Golos.Tests.csproj" -c Release -r "win-$Arch" --self-contained true "-p:Version=$Version" -o $tests
 if ($LASTEXITCODE) { throw 'Test compilation failed' }
 $nativeLibraries | ForEach-Object { Copy-Item $_.FullName $tests -Force }
 & "$tests/Golos.Tests.exe" "$package/Resources/ggml-large-v3-turbo-q5_0.bin" "$root/tests/fixtures"
@@ -35,7 +38,7 @@ if ($LASTEXITCODE) { throw 'Recognition tests failed' }
 $preview=Start-Process "$package/Golos.exe" -ArgumentList @('--render-ui',"`"$root/dist/Windows-$Arch.png`"") -PassThru -Wait
 if ($preview.ExitCode -ne 0) { throw 'UI smoke test failed' }
 Compress-Archive -Path $package -DestinationPath "$package.zip" -Force
-Get-FileHash "$package.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  Golos-1.7.3-Windows-$Arch.zip" } | Set-Content "$package.zip.sha256"
+Get-FileHash "$package.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  Golos-$Version-Windows-$Arch.zip" } | Set-Content "$package.zip.sha256"
 $compiler=Get-ChildItem "${env:ProgramFiles(x86)}/Inno Setup */ISCC.exe", "$env:ProgramFiles/Inno Setup */ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 if (!$compiler) {
   $installer=Join-Path $root '.build/innosetup.exe'
@@ -48,9 +51,9 @@ if (!$compiler) {
   if ($setup.ExitCode -ne 0) { throw 'Inno Setup installation failed' }
   $compiler=Join-Path $inno 'ISCC.exe'
 }
-& $compiler "/DPackageDir=$package" "/DOutputDir=$root/dist" "/DTargetArch=$Arch" "$PSScriptRoot/windows-installer.iss"
+& $compiler "/DPackageDir=$package" "/DOutputDir=$root/dist" "/DTargetArch=$Arch" "/DAppVersion=$Version" "$PSScriptRoot/windows-installer.iss"
 if ($LASTEXITCODE) { throw 'Installer compilation failed' }
-$setupFile=Join-Path $root "dist/Golos-1.7.3-Windows-$Arch-Setup.exe"
+$setupFile=Join-Path $root "dist/Golos-$Version-Windows-$Arch-Setup.exe"
 # Verify that a clean per-user installation contains the complete offline app.
 $smokeDir=Join-Path $root ".build/installed-$Arch"
 $install=Start-Process $setupFile -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"`"/DIR=$smokeDir`"") -PassThru -Wait
@@ -61,3 +64,23 @@ foreach ($file in @('Golos.exe','golos_native.dll','Resources/ggml-large-v3-turb
 $installedPreview=Start-Process "$smokeDir/Golos.exe" -ArgumentList @('--render-ui',"`"$root/dist/Windows-$Arch.png`"") -PassThru -Wait
 if ($installedPreview.ExitCode -ne 0) { throw 'Installed application smoke test failed' }
 Get-FileHash $setupFile -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($setupFile))" } | Set-Content "$setupFile.sha256"
+$sourceCommit=(git -C $root rev-parse HEAD)
+if ($LASTEXITCODE) { throw 'Cannot identify source commit for validation manifest' }
+$files=[ordered]@{}
+foreach ($file in @('Golos.exe','Golos.dll','Golos.Core.dll','golos_native.dll','Resources/ggml-large-v3-turbo-q5_0.bin','Resources/ggml-silero-v5.1.2.bin')) {
+  $hash=(Get-FileHash (Join-Path $package $file) -Algorithm SHA256).Hash.ToLower()
+  $installedHash=(Get-FileHash (Join-Path $smokeDir $file) -Algorithm SHA256).Hash.ToLower()
+  if ($hash -ne $installedHash) { throw "Installed binary differs from tested package: $file" }
+  $files[$file]=$hash
+}
+[ordered]@{
+  version=$Version; architecture=$Arch; source_commit=$sourceCommit.Trim()
+  os=[Environment]::OSVersion.VersionString; generated_utc=[DateTime]::UtcNow.ToString('o')
+  binary_sha256=$files
+  checks=[ordered]@{
+    portable_logic='PASS'; native_audio_fixtures='PASS'; model_hashes='PASS'
+    rendered_ui='PASS'; installer_smoke='PASS'; installed_binary_match='PASS'
+    live_target_input='NOT_RUN'; microphone_hotkey='NOT_RUN'; tab_mouse_return='NOT_RUN'
+  }
+  release_ready=$false
+} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $root "dist/Golos-$Version-Windows-$Arch-validation.json")
