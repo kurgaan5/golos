@@ -4,6 +4,19 @@ import AVFoundation
 import Carbon
 import ApplicationServices
 import Darwin
+import ServiceManagement
+
+// Login launch prepares the shortcut; it must never start capture or steal focus.
+enum StartupPolicy {
+    static func background(arguments: [String], loginEvent: Bool) -> Bool {
+        loginEvent || arguments.contains("--background")
+    }
+    static var isLoginEvent: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent else { return false }
+        return event.eventID == kAEOpenApplication &&
+            event.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+    }
+}
 
 // Hold an OS lock for the lifetime of the GUI process. A second copy must never
 // install its hotkey or construct an audio engine, even when launched from a DMG.
@@ -244,6 +257,37 @@ enum FormattingPlan {
     }
 }
 
+// Reject decoder loops before they reach either live insertion or history.
+// These are deliberately generous ceilings, not a normal speaking-speed target.
+enum RecognitionPolicy {
+    private static let pattern = try! NSRegularExpression(pattern: #"[\p{L}\p{N}]+"#)
+    static func rejection(_ text: String, audioSeconds: Double) -> String? {
+        if text.range(of: #"^(?:НАПРЯЖ[ЕЁ]ННАЯ МУЗЫКА|МУЗЫКА|АПЛОДИСМЕНТЫ|СМЕХ|ШУМ)[.!…]*$"#, options: .regularExpression) != nil { return "sound_caption" }
+        let ns = text as NSString
+        let words = pattern.matches(in: text, range: NSRange(location: 0, length: ns.length)).map {
+            ns.substring(with: $0.range).lowercased().replacingOccurrences(of: "ё", with: "е")
+        }
+        if words.count > max(16, Int(ceil(max(0, audioSeconds) * 10)) + 6) { return "word_rate" }
+        // Preserve ordinary emphasis (including four 'да') and repetitions in
+        // distinct sentences. Only long consecutive decoder cycles are rejected.
+        guard words.count >= 12 else { return nil }
+        for width in 1...min(6, words.count / 6) {
+            for start in 0...(words.count - width * 6) {
+                var end = start + width
+                while end + width <= words.count &&
+                    words[start..<(start + width)].elementsEqual(words[end..<(end + width)]) { end += width }
+                if (end - start) / width >= 6 && end - start >= 12 { return "repetition_loop" }
+            }
+        }
+        return nil
+    }
+}
+
+enum RecognitionFailure: LocalizedError {
+    case unreliable
+    var errorDescription: String? { "Сомнительный фрагмент не вставлен. Повторите последнюю фразу." }
+}
+
 // Local agreement: only new, confirmed words are emitted. A revised hypothesis
 // can never re-emit the already committed beginning of a phrase.
 struct StableTranscript {
@@ -252,7 +296,6 @@ struct StableTranscript {
     private(set) var committed = ""
     private var previous = ""
     private var finished = false
-    private var stalled = 0
     private static func words(_ text: String) -> [Word] {
         let ns = text as NSString
         return pattern.matches(in: text, range: NSRange(location: 0, length: ns.length)).map { Word(key: ns.substring(with: $0.range).lowercased(), range: $0.range) }
@@ -277,19 +320,17 @@ struct StableTranscript {
                     }
                 }
             }
-            var stable = min(agreement, max(0, current.count - 1))
-            // Short bounded fallback: waiting indefinitely for identical prefixes
-            // creates 10–24 second pauses. Keep two trailing words provisional.
-            if stalled >= 2 && current.count >= 4 { stable = max(stable, current.count - 2) }
+            let stable = min(agreement, max(0, current.count - 1))
+            // Never turn a completely unrelated hypothesis into confirmed text
+            // just because earlier hypotheses disagreed. Wait for actual agreement.
             previous = text
-            stalled += 1
             guard stable > 0 else { return "" }
             candidate = (text as NSString).substring(to: current[stable].range.location)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .trimmingCharacters(in: CharacterSet(charactersIn: ".!?…"))
         } else { finished = true }
         guard !candidate.isEmpty else { return "" }
-        if committed.isEmpty { committed = candidate; stalled = 0; return candidate }
+        if committed.isEmpty { committed = candidate; return candidate }
         let ledger = Self.words(committed), proposed = Self.words(candidate)
         guard !ledger.isEmpty else { return "" }
         var end: Int?
@@ -329,7 +370,7 @@ struct StableTranscript {
         }
         tail = Transcript.balancedAppend(prefix: committed, tail: tail)
         guard !tail.isEmpty else { return "" }
-        committed += tail; stalled = 0
+        committed += tail
         return tail
     }
 }
@@ -504,8 +545,13 @@ final class Recognizer {
             let language = "ru" // Russian primary; English terms stay inside the Russian context.
             if let context = self.context,
                let raw = vocabulary.prompt.withCString({ prompt in language.withCString { lang in audio.withUnsafeBufferPointer { golos_transcribe(context, $0.baseAddress, Int32($0.count), lang, final ? 1 : 0, prompt) } } }) {
-                result = .success(Transcript.sentenceCase(vocabulary.canonicalize(Transcript.clean(String(cString: raw)))))
+                let text = Transcript.sentenceCase(vocabulary.canonicalize(Transcript.clean(String(cString: raw))))
                 golos_free_text(raw)
+                let reason = RecognitionPolicy.rejection(text, audioSeconds: Double(samples.count) / 16000)
+                if let reason {
+                    Diagnostics.log("decode.rejected segment=\(segmentID) reason=\(reason) chars=\(text.count) audio=\(Double(samples.count) / 16000) final=\(final)")
+                    result = .failure(RecognitionFailure.unreliable)
+                } else { result = .success(text) }
             } else {
                 result = .failure(NSError(domain: "Голос", code: 2, userInfo: [NSLocalizedDescriptionKey: "Не удалось распознать фразу. Проверьте свободную память."]))
             }
@@ -573,23 +619,225 @@ enum EditableFieldPolicy {
     }
 }
 
-// Qt can advertise writable AXValue yet return a permanently empty value.
-// Its text-range interface is authoritative; otherwise treat the editor as opaque.
+struct EditorTextSnapshot {
+    let text: String?
+    let permitsWholeValue: Bool
+    let source: String
+}
+
+// AXValue may expose placeholder text or a synthetic final newline. Prefer
+// the actual character range; never copy an unverified label back into a field.
 enum EditorTextPolicy {
+    static func snapshot(role: String, value: String?, rangeText: String?, characterCount: Int? = nil, placeholder: String? = nil) -> EditorTextSnapshot {
+        if let rangeText { return EditorTextSnapshot(text: rangeText, permitsWholeValue: true, source: "range") }
+        if characterCount == 0 { return EditorTextSnapshot(text: "", permitsWholeValue: true, source: "zero_count") }
+        if role == kAXStaticTextRole { return EditorTextSnapshot(text: nil, permitsWholeValue: false, source: "opaque") }
+        if let value, let placeholder, !placeholder.isEmpty,
+           characterCount == nil, value.trimmingCharacters(in: .whitespacesAndNewlines) == placeholder.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return EditorTextSnapshot(text: "", permitsWholeValue: false, source: "placeholder")
+        }
+        guard let value else { return EditorTextSnapshot(text: nil, permitsWholeValue: false, source: "unavailable") }
+        if let count = characterCount, count >= 0 {
+            if value.utf16.count == count { return EditorTextSnapshot(text: value, permitsWholeValue: true, source: "counted_value") }
+            if value.hasSuffix("\n"), value.utf16.count == count + 1 {
+                return EditorTextSnapshot(text: String(value.dropLast()), permitsWholeValue: true, source: "counted_terminator")
+            }
+            return EditorTextSnapshot(text: nil, permitsWholeValue: false, source: "inconsistent_count")
+        }
+        return EditorTextSnapshot(text: value, permitsWholeValue: false, source: "unverified_value")
+    }
     static func read(role: String, value: String?, rangeText: String?) -> String? {
-        if role == kAXStaticTextRole { return rangeText }
-        return value ?? rangeText
+        snapshot(role: role, value: value, rangeText: rangeText).text
     }
 }
 
-enum DeliveryMethod: String, Hashable { case paste, selectedText, value }
+enum RecordingPanelPolicy {
+    static func visible(enabled: Bool, recording: Bool, pending: Int, waiting: Int) -> Bool { enabled && recording }
+}
+
+enum UnicodeInputPlan {
+    static func chunks(_ text: String) -> [String] {
+        var result: [String] = [], chunk = ""
+        for character in text {
+            if !chunk.isEmpty && chunk.utf16.count + String(character).utf16.count > 16 { result.append(chunk); chunk = "" }
+            chunk.append(character)
+        }
+        if !chunk.isEmpty { result.append(chunk) }
+        return result
+    }
+}
+
+enum DeliveryMethod: String, Hashable { case typing, paste, selectedText, value }
 
 enum DeliveryPolicy {
     static func choose(foreground: Bool, hasRange: Bool, selectedWritable: Bool, valueWritable: Bool, disabled: Set<DeliveryMethod>) -> DeliveryMethod? {
-        if foreground { return disabled.contains(.paste) ? nil : .paste }
+        // Paste lets the editor own its content/selection semantics. In the
+        // foreground it must not be replaced with a possibly synthetic AXValue.
+        if foreground {
+            if !disabled.contains(.typing) { return .typing }
+            return disabled.contains(.paste) ? nil : .paste
+        }
         if hasRange && selectedWritable && !disabled.contains(.selectedText) { return .selectedText }
         if hasRange && valueWritable && !disabled.contains(.value) { return .value }
         return nil
+    }
+}
+
+// Classify readback without replaying an ambiguous already-dispatched delta.
+// The delivery lifecycle below is based on the owner-verified 1.7.3 controller.
+enum DeliveryReceipt: Equatable {
+    case confirmed, noEffect, unavailable, ambiguous
+    private static func equivalent(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        // Some editors add/remove one document terminator. Do not normalize
+        // spaces, interior newlines or arbitrary edits.
+        return (a.hasSuffix("\n") && String(a.dropLast()) == b) || (b.hasSuffix("\n") && String(b.dropLast()) == a)
+    }
+    static func classify(baseline: String?, desired: String?, actual: String?, observable: Bool,
+                         pastedAddition: String? = nil) -> Self {
+        guard observable, let actual else { return .unavailable }
+        if let desired, actual == desired { return .confirmed }
+        if let baseline, equivalent(actual, baseline) { return .noEffect }
+        if let desired, equivalent(actual, desired) { return .confirmed }
+        // A standard paste can replace a placeholder/selection which AX had
+        // described as old text. An exact new value containing only our paste
+        // is positive acknowledgement; never resend it to chase a wrong baseline.
+        if let pastedAddition, !pastedAddition.isEmpty, equivalent(actual, pastedAddition) { return .confirmed }
+        return .ambiguous
+    }
+}
+
+// A dispatched prefix remains queued until its original editor can acknowledge
+// it. Missing readback is temporary; positively changed text is terminal for
+// that attempt, so it cannot block every later word.
+struct DeliveryAttempt {
+    let id = UUID()
+    let addition: String
+    let baseline: String?
+    let desired: String?
+    let selectionBefore: CFRange?
+    let method: DeliveryMethod
+    var sawDeparture = false
+    var suspended = false
+    var unchangedForegroundReads = 0
+}
+
+enum ReceiptResolution {
+    case waiting, stale
+    case confirmed(DeliveryAttempt), retrySafe(DeliveryAttempt)
+    case ambiguous(DeliveryAttempt), sentUnobservable(DeliveryAttempt)
+}
+
+struct DeliveryLifecycle {
+    var pending = ""
+    private(set) var uncertain = false
+    private(set) var continueOnlyAtCaret = false
+    private(set) var inFlight: DeliveryAttempt?
+
+    mutating func begin(addition: String, baseline: String?, desired: String?, selection: CFRange?, method: DeliveryMethod) -> UUID {
+        precondition(inFlight == nil, "Only one dispatch may await an editor receipt")
+        let attempt = DeliveryAttempt(addition: addition, baseline: baseline, desired: desired, selectionBefore: selection, method: method)
+        inFlight = attempt
+        return attempt.id
+    }
+    func contains(_ id: UUID) -> Bool { inFlight?.id == id }
+    mutating func noteFocus(_ id: UUID, originalContext: Bool, foreground: Bool) {
+        guard var attempt = inFlight, attempt.id == id else { return }
+        if !originalContext || !foreground {
+            attempt.sawDeparture = true; attempt.unchangedForegroundReads = 0
+        }
+        inFlight = attempt
+    }
+    mutating func suspend(_ id: UUID) {
+        guard var attempt = inFlight, attempt.id == id else { return }
+        attempt.suspended = true; inFlight = attempt
+    }
+    mutating func observe(_ id: UUID, actual: String?, originalContext: Bool, foreground: Bool) -> ReceiptResolution {
+        guard var attempt = inFlight, attempt.id == id else { return .stale }
+        if attempt.desired == nil {
+            retire(attempt, uncertain: true, needsCaret: false)
+            return .sentUnobservable(attempt)
+        }
+        guard originalContext, let actual else {
+            attempt.unchangedForegroundReads = 0
+            if !originalContext || !foreground { attempt.sawDeparture = true }
+            inFlight = attempt
+            return .waiting
+        }
+        // Once a receipt was suspended, a hidden AX cache cannot settle it.
+        guard !attempt.suspended || foreground else {
+            attempt.sawDeparture = true; attempt.unchangedForegroundReads = 0
+            inFlight = attempt
+            return .waiting
+        }
+        let receipt = DeliveryReceipt.classify(baseline: attempt.baseline, desired: attempt.desired, actual: actual,
+            observable: true, pastedAddition: attempt.method == .typing || attempt.method == .paste ? attempt.addition : nil)
+        switch receipt {
+        case .confirmed:
+            retire(attempt, uncertain: false, needsCaret: false)
+            return .confirmed(attempt)
+        case .noEffect:
+            guard foreground else {
+                attempt.sawDeparture = true; attempt.unchangedForegroundReads = 0
+                inFlight = attempt
+                return .waiting
+            }
+            attempt.unchangedForegroundReads += 1
+            guard attempt.unchangedForegroundReads >= 2 else { inFlight = attempt; return .waiting }
+            inFlight = nil // The original prefix is still pending for a safe retry.
+            return .retrySafe(attempt)
+        case .ambiguous:
+            guard foreground else {
+                attempt.sawDeparture = true; attempt.unchangedForegroundReads = 0
+                inFlight = attempt
+                return .waiting
+            }
+            retire(attempt, uncertain: true, needsCaret: true)
+            return .ambiguous(attempt)
+        case .unavailable:
+            inFlight = attempt
+            return .waiting
+        }
+    }
+    private mutating func retire(_ attempt: DeliveryAttempt, uncertain newUncertainty: Bool, needsCaret: Bool) {
+        if pending.hasPrefix(attempt.addition) { pending.removeFirst(attempt.addition.count) }
+        else { uncertain = true }
+        uncertain = uncertain || newUncertainty
+        continueOnlyAtCaret = continueOnlyAtCaret || needsCaret
+        inFlight = nil
+    }
+    mutating func establishContinuationCaret() { continueOnlyAtCaret = false }
+    mutating func cancelPending() {
+        pending = ""; inFlight = nil; uncertain = true; continueOnlyAtCaret = false
+    }
+}
+
+enum FieldRecoveryPolicy {
+    static func accepts(sameWindow: Bool, sameDocument: Bool, sameIdentifier: Bool,
+                        expected: String?, actual: String?, sameTab: Bool = false,
+                        sameURL: Bool = false, oldFieldAlive: Bool = true,
+                        sameNativeDocument: Bool = false, sameRole: Bool = false) -> Bool {
+        guard sameWindow else { return false }
+        // sameDocument means the same physical AXWebArea, never just an equal
+        // URL. A duplicated tab has the same URL, DOM IDs and possibly draft.
+        if sameDocument { return sameIdentifier }
+        // Native saved documents can lack DOM IDs. Their same file URL and
+        // window, dead old client, role and substantial exact draft form a
+        // separate witness; window title or draft text alone never suffice.
+        if sameNativeDocument, sameRole, !oldFieldAlive,
+           let expected, expected.count >= 12, expected == actual { return true }
+        // A reload may replace the web area. Only the original selected native
+        // tab, a matching document/field and a dead old client can witness it.
+        guard sameTab, sameURL, sameIdentifier, !oldFieldAlive,
+              let expected, let actual, expected == actual else { return false }
+        return true
+    }
+}
+
+enum NavigationScopePolicy {
+    static func permitsSharedClient(hasTabWitness: Bool, originalTabSelected: Bool,
+                                    titleMatches: Bool, invalidated: Bool) -> Bool {
+        hasTabWitness ? originalTabSelected : titleMatches && !invalidated
     }
 }
 
@@ -604,20 +852,31 @@ final class TextInserter {
         var identifier: String?
         var contextURL: String?
         var windowTitle: String?
+        var navigationTab: AXUIElement?
+        var toolbarScoped = false
+        var webScoped = false
+        var fieldRole: String?
         var value: String?
         var selection: CFRange?
-        var pending = ""
+        var delivery = DeliveryLifecycle()
+        var pending: String {
+            get { delivery.pending }
+            set { delivery.pending = newValue }
+        }
         var finalIDs: [UUID] = []
         var retryAfter = Date.distantPast
         var reported = ""
-        var uncertain = false
+        var uncertain: Bool { delivery.uncertain }
         var disabledMethods = Set<DeliveryMethod>()
         var keyboardOnly = false
         var keyboardGuard = KeyboardFallbackGuard()
         var formatting: [(emitted: String, formatted: String)] = []
-        init(pid: pid_t, name: String, field: AXUIElement, window: AXUIElement?, context: AXUIElement?, identifier: String?, contextURL: String?, windowTitle: String?, value: String?, selection: CFRange?) {
+        var verifiedPaste = false
+        init(pid: pid_t, name: String, field: AXUIElement, window: AXUIElement?, context: AXUIElement?, identifier: String?, contextURL: String?, windowTitle: String?, value: String?, selection: CFRange?, navigationTab: AXUIElement? = nil, toolbarScoped: Bool = false, webScoped: Bool = false, fieldRole: String? = nil) {
             self.pid = pid; self.name = name; self.field = field; self.value = value; self.selection = selection
             self.window = window; self.context = context; self.identifier = identifier; self.contextURL = contextURL; self.windowTitle = windowTitle
+            self.navigationTab = navigationTab; self.toolbarScoped = toolbarScoped; self.webScoped = webScoped
+            self.fieldRole = fieldRole
         }
     }
     private final class Session {
@@ -632,11 +891,13 @@ final class TextInserter {
     private var active: Target?
     private var prepared = Set<pid_t>()
     private var busy = false
+    private var busyAttempt: UUID?
     private(set) var destinationName = "Щёлкните в текстовом поле"
     private(set) var deliveryStatus = "" { didSet { if deliveryStatus != oldValue { onStatus?(deliveryStatus) } } }
     var onStatus: ((String) -> Void)?
     var onConfirmed: ((UUID) -> Void)?
     var isInserting: Bool { busy }
+    func committedText(_ id: UUID) -> String { sessions[id]?.transcript.committed ?? "" }
     var pendingCharacters: Int { targets.reduce(0) { $0 + ($1.pending as NSString).length } }
     private(set) var waitingForField = false
 
@@ -644,21 +905,31 @@ final class TextInserter {
         var value: CFTypeRef?
         return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
     }
-    private func textValue(_ field: AXUIElement) -> String? {
+    private func readText(_ field: AXUIElement) -> EditorTextSnapshot {
         let role = attribute(field, kAXRoleAttribute) as? String ?? ""
         let value = role == kAXStaticTextRole ? nil : attribute(field, kAXValueAttribute) as? String
-        if let value { return value }
+        let count = (attribute(field, kAXNumberOfCharactersAttribute) as? NSNumber)?.intValue
         var rangeText: String?
-        if let count = (attribute(field, kAXNumberOfCharactersAttribute) as? NSNumber)?.intValue, count >= 0 {
-            var range = CFRange(location: 0, length: count)
-            if let parameter = AXValueCreate(.cfRange, &range) {
-                var result: CFTypeRef?
-                if AXUIElementCopyParameterizedAttributeValue(field, kAXStringForRangeParameterizedAttribute as CFString, parameter, &result) == .success {
-                    rangeText = result as? String
+        if let count, count >= 0, count <= 1_000_000 {
+            if count == 0 { rangeText = "" }
+            else {
+                var range = CFRange(location: 0, length: count)
+                if let parameter = AXValueCreate(.cfRange, &range) {
+                    var result: CFTypeRef?
+                    if AXUIElementCopyParameterizedAttributeValue(field, kAXStringForRangeParameterizedAttribute as CFString, parameter, &result) == .success {
+                        rangeText = result as? String
+                    }
                 }
             }
         }
-        return EditorTextPolicy.read(role: role, value: value, rangeText: rangeText)
+        return EditorTextPolicy.snapshot(role: role, value: value, rangeText: rangeText,
+            characterCount: count, placeholder: attribute(field, "AXPlaceholderValue") as? String)
+    }
+    private func textValue(_ field: AXUIElement) -> String? { readText(field).text }
+    func prepareFrontmost() {
+        guard AXIsProcessTrusted(), let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              pid != ProcessInfo.processInfo.processIdentifier, !prepared.contains(pid) else { return }
+        _ = focused(pid) // Enable lazy providers before the first hotkey, without capturing audio or text.
     }
     private func focused(_ pid: pid_t) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
@@ -720,21 +991,92 @@ final class TextInserter {
         }
         return nil
     }
+    private func hasToolbarAncestor(_ field: AXUIElement) -> Bool {
+        var current: AXUIElement? = field
+        for _ in 0..<16 {
+            guard let node = current else { break }
+            let role = attribute(node, kAXRoleAttribute) as? String
+            if role == "AXToolbar" { return true }
+            if role == "AXWebArea" || role == kAXWindowRole { return false }
+            current = element(attribute(node, kAXParentAttribute))
+        }
+        return false
+    }
+    private func tabSelected(_ tab: AXUIElement) -> Bool {
+        if (attribute(tab, kAXSelectedAttribute) as? Bool) == true { return true }
+        if (attribute(tab, kAXValueAttribute) as? NSNumber)?.intValue == 1 { return true }
+        if let group = element(attribute(tab, kAXParentAttribute)),
+           attribute(group, kAXRoleAttribute) as? String == "AXTabGroup",
+           let selected = attribute(group, kAXSelectedChildrenAttribute) as? [AXUIElement] {
+            return selected.contains { CFEqual($0, tab) }
+        }
+        return false
+    }
+    private func selectedNavigationTab(in window: AXUIElement?) -> AXUIElement? {
+        guard let window else { return nil }
+        // Inspect native window chrome only. A tab widget inside a web page is
+        // not evidence of the browser document/tab that owns the editor.
+        var stack: [(AXUIElement, Int)] = [(window, 0)]
+        var remaining = 160
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.12
+        var candidates: [AXUIElement] = []
+        while let (node, depth) = stack.popLast(), remaining > 0, ProcessInfo.processInfo.systemUptime < deadline {
+            remaining -= 1
+            AXUIElementSetMessagingTimeout(node, 0.015)
+            let role = attribute(node, kAXRoleAttribute) as? String
+            if role == "AXWebArea" { continue }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
+            let children = attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []
+            if role == "AXTabGroup" {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
+                let explicit = attribute(node, kAXSelectedChildrenAttribute) as? [AXUIElement] ?? []
+                var selected = explicit
+                if selected.isEmpty {
+                    for child in children {
+                        guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
+                        AXUIElementSetMessagingTimeout(child, 0.015)
+                        if tabSelected(child) { selected.append(child) }
+                    }
+                }
+                if selected.count == 1 { candidates.append(selected[0]) }
+                continue
+            }
+            if depth < 9 { stack.append(contentsOf: children.reversed().map { ($0, depth + 1) }) }
+        }
+        // Multiple unrelated native tab groups provide no unique witness.
+        guard stack.isEmpty else { return nil }
+        return candidates.count == 1 ? candidates[0] : nil
+    }
     private func identifier(_ field: AXUIElement) -> String? {
-        let value = (attribute(field, "AXDOMIdentifier") as? String) ?? (attribute(field, kAXIdentifierAttribute) as? String)
-        return value?.isEmpty == false ? value : nil
+        [attribute(field, "AXDOMIdentifier") as? String, attribute(field, kAXIdentifierAttribute) as? String]
+            .compactMap { $0 }.first { !$0.isEmpty }
     }
     private func url(_ context: AXUIElement?) -> String? {
         guard let context else { return nil }
         if let url = attribute(context, kAXURLAttribute) as? URL { return url.absoluteString }
-        return attribute(context, kAXURLAttribute) as? String
+        if let value = attribute(context, kAXURLAttribute) as? String { return value }
+        if let value = attribute(context, kAXDocumentAttribute) as? URL { return value.absoluteString }
+        return attribute(context, kAXDocumentAttribute) as? String
     }
     private func logicalContextValid(_ target: Target) -> Bool {
         if let expected = target.contextURL, url(target.context) != expected { return false }
+        if target.webScoped {
+            guard let original = target.context, let current = context(of: target.field), CFEqual(original, current) else { return false }
+        }
+        let contextIsWindow = target.context.flatMap { attribute($0, kAXRoleAttribute) as? String } == kAXWindowRole
+        if target.keyboardOnly || target.toolbarScoped || (contextIsWindow && target.navigationTab != nil) {
+            let titleMatches = target.windowTitle.flatMap { expected in
+                target.window.flatMap { attribute($0, kAXTitleAttribute) as? String }.map { $0 == expected }
+            } ?? false
+            if target.toolbarScoped && target.navigationTab == nil {
+                target.keyboardGuard.observeContext(matches: titleMatches, identifiable: target.windowTitle?.isEmpty == false)
+            }
+            return NavigationScopePolicy.permitsSharedClient(hasTabWitness: target.navigationTab != nil,
+                originalTabSelected: target.navigationTab.map { tabSelected($0) } ?? false,
+                titleMatches: titleMatches, invalidated: !target.keyboardOnly && target.keyboardGuard.invalidated)
+        }
         // For real text clients the pinned element/document is authoritative.
         // A changing unread count or app title must not invalidate that field.
-        if target.keyboardOnly, let expected = target.windowTitle, let window = target.window,
-           let current = attribute(window, kAXTitleAttribute) as? String, expected != current { return false }
         return true
     }
     private func focusedWindow(_ pid: pid_t) -> AXUIElement? {
@@ -752,7 +1094,8 @@ final class TextInserter {
         guard KeyboardFallbackGuard.acceptsAnchor(role: role, secure: secure, enabled: enabled) else { return nil }
         let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "Приложение"
         let target = Target(pid: pid, name: name, field: anchor ?? window, window: window, context: window,
-            identifier: nil, contextURL: nil, windowTitle: attribute(window, kAXTitleAttribute) as? String, value: nil, selection: nil)
+            identifier: nil, contextURL: nil, windowTitle: attribute(window, kAXTitleAttribute) as? String, value: nil, selection: nil,
+            navigationTab: selectedNavigationTab(in: window), fieldRole: role)
         target.keyboardOnly = true
         Diagnostics.log("target.capture app=\(name) mode=keyboard role=\(role ?? "none")")
         return target
@@ -762,13 +1105,19 @@ final class TextInserter {
         guard editable(field) else { return nil }
         var pid: pid_t = 0
         guard AXUIElementGetPid(field, &pid) == .success, pid != ProcessInfo.processInfo.processIdentifier else { return nil }
-        let value = textValue(field)
+        let snapshot = readText(field), value = snapshot.text
         let selection = caret(field) ?? (value == "" ? CFRange(location: 0, length: 0) : nil)
         let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "Приложение"
         Diagnostics.log("target.capture app=\(name) role=\(attribute(field, kAXRoleAttribute) as? String ?? "?") readable=\(value != nil) caret=\(selection != nil) valueWritable=\(settable(field, kAXValueAttribute)) selectedWritable=\(settable(field, kAXSelectedTextAttribute))")
-        let window = element(attribute(field, kAXWindowAttribute))
-        let context = context(of: field)
-        return Target(pid: pid, name: name, field: field, window: window, context: context, identifier: identifier(field), contextURL: url(context), windowTitle: window.flatMap { attribute($0, kAXTitleAttribute) as? String }, value: value, selection: selection)
+        let window = element(attribute(field, kAXWindowAttribute)) ?? focusedWindow(pid)
+        let context = context(of: field) ?? window
+        let webScoped = context.flatMap { attribute($0, kAXRoleAttribute) as? String } == "AXWebArea"
+        let toolbarScoped = hasToolbarAncestor(field)
+        let navigationTab = webScoped || toolbarScoped ? selectedNavigationTab(in: window) : nil
+        Diagnostics.log("target.identity identifier=\(identifier(field) != nil) document=\(url(context) != nil) contextRole=\(context.flatMap { attribute($0, kAXRoleAttribute) as? String } ?? "none") tab=\(navigationTab != nil) toolbar=\(toolbarScoped) reader=\(snapshot.source) wholeValue=\(snapshot.permitsWholeValue) chars=\(value?.utf16.count ?? -1)")
+        return Target(pid: pid, name: name, field: field, window: window, context: context, identifier: identifier(field), contextURL: url(context), windowTitle: window.flatMap { attribute($0, kAXTitleAttribute) as? String }, value: value, selection: selection,
+            navigationTab: navigationTab, toolbarScoped: toolbarScoped, webScoped: webScoped,
+            fieldRole: attribute(field, kAXRoleAttribute) as? String)
     }
     private func activate(_ target: Target?) {
         if let target {
@@ -786,10 +1135,18 @@ final class TextInserter {
         if let target { targets.append(target); destinationName = target.name }
         else { destinationName = "Щёлкните в текстовом поле" }
     }
-    @discardableResult func startDictation() -> Bool {
+    @discardableResult func startDictation(testWindowPrefix: String? = nil) -> Bool {
         waitingForField = false
         guard let front = NSWorkspace.shared.frontmostApplication, !IsSecureEventInputEnabled() else { activate(nil); return false }
         let field = focused(front.processIdentifier)
+        if let prefix = testWindowPrefix, !prefix.isEmpty {
+            let title = focusedWindow(front.processIdentifier).flatMap { attribute($0, kAXTitleAttribute) as? String } ?? ""
+            let webContext = editor(around: field).flatMap { context(of: $0) }
+            let documentTitle = webContext.flatMap { attribute($0, kAXRoleAttribute) as? String == "AXWebArea" ? attribute($0, kAXTitleAttribute) as? String : nil } ?? ""
+            guard title.hasPrefix(prefix) || documentTitle.hasPrefix(prefix) else {
+                Diagnostics.log("test.cancelled wrong_window=true app=\(front.localizedName ?? "?")"); return false
+            }
+        }
         let target = editor(around: field).flatMap { capture($0) } ?? keyboardTarget(pid: front.processIdentifier, anchor: field)
         if target == nil {
             let role = field.flatMap { attribute($0, kAXRoleAttribute) as? String } ?? "none"
@@ -809,7 +1166,7 @@ final class TextInserter {
                 if AXUIElementGetPid(hit, &pid) == .success { clickPID = pid }
             }
         }
-        for target in targets where target.keyboardOnly && (target === active || !target.pending.isEmpty) {
+        for target in targets where (target.keyboardOnly || (target.toolbarScoped && target.navigationTab == nil)) && (target === active || !target.pending.isEmpty) {
             // A missing AX hit while browsing another app is not an input
             // change in the pinned editor. Do not permanently revoke it.
             let inTarget = mouse ? (clickPID.map { $0 == target.pid } ?? (frontPID == target.pid)) : frontPID == target.pid
@@ -861,7 +1218,7 @@ final class TextInserter {
         if final {
             let formatted = String(session.emitted.prefix(while: { $0.isWhitespace })) + Transcript.sentenceCase(Transcript.clean(text))
             if session.emitted != formatted && FormattingPlan.sameWords(session.emitted, formatted) {
-                if !busy && target.pending.hasSuffix(session.emitted) {
+                if !busy && target.delivery.inFlight == nil && target.pending.hasSuffix(session.emitted) {
                     target.pending.removeLast(session.emitted.count); target.pending += formatted
                 } else { target.formatting.append((session.emitted, formatted)) }
             }
@@ -874,24 +1231,50 @@ final class TextInserter {
     }
     private func isFocused(_ target: Target) -> Bool {
         let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid
-        guard frontmost, logicalContextValid(target) else { return false }
+        guard frontmost else { return false }
         let rawFocus = focused(target.pid)
         let focus = editor(around: rawFocus) ?? rawFocus
         if target.keyboardOnly {
+            guard logicalContextValid(target) else { return false }
             let window = focusedWindow(target.pid)
             let sameWindow = target.window.flatMap { expected in window.map { CFEqual(expected, $0) } } ?? false
             let sameFocus = focus.map { CFEqual($0, target.field) } ?? (window.map { CFEqual($0, target.field) } ?? false)
             return target.keyboardGuard.allows(frontmost: frontmost, sameWindow: sameWindow, sameFocus: sameFocus, secure: IsSecureEventInputEnabled())
         }
         guard let field = focus else { return false }
-        if CFEqual(field, target.field) { return true }
+        if CFEqual(field, target.field), logicalContextValid(target) { return true }
         // Web editors often recreate their composer after Send. Rebind only to
         // the same ID in the same document and window, never to an arbitrary field.
-        guard let expectedID = target.identifier, identifier(field) == expectedID,
-              let oldWindow = target.window, let window = element(attribute(field, kAXWindowAttribute)), CFEqual(oldWindow, window),
-              let oldContext = target.context, let currentContext = context(of: field), CFEqual(oldContext, currentContext), editable(field) else { return false }
+        guard editable(field), let oldWindow = target.window,
+              let window = element(attribute(field, kAXWindowAttribute)) ?? focusedWindow(target.pid) else { return false }
+        let currentContext = context(of: field) ?? window
+        let sameContext = target.context.map { CFEqual($0, currentContext) } ?? false
+        let sameURL = target.contextURL.map { !$0.isEmpty && url(currentContext) == $0 } ?? false
+        if let expectedURL = target.contextURL, url(currentContext) != expectedURL { return false }
+        let sameID = target.identifier.map { !$0.isEmpty && identifier(field) == $0 } ?? false
+        let documentWitness = sameContext && attribute(currentContext, kAXRoleAttribute) as? String == "AXWebArea"
+        let sameTab = target.navigationTab.map { tabSelected($0) } ?? false
+        let oldFieldAlive = attribute(target.field, kAXRoleAttribute) != nil
+        let sameRole = target.fieldRole.map { attribute(field, kAXRoleAttribute) as? String == $0 } ?? false
+        let sameNativeDocument = !target.webScoped && !target.toolbarScoped && target.navigationTab == nil &&
+            !hasToolbarAncestor(field) && attribute(currentContext, kAXRoleAttribute) as? String == kAXWindowRole &&
+            sameURL && (target.contextURL.flatMap { URL(string: $0) }?.isFileURL == true)
+        let actual = textValue(field)
+        // A pending acknowledgement may already be present in the newly created client.
+        let expected = target.delivery.inFlight.flatMap { attempt in
+            actual == attempt.desired ? attempt.desired : nil
+        } ?? target.value
+        guard FieldRecoveryPolicy.accepts(sameWindow: CFEqual(oldWindow, window), sameDocument: documentWitness,
+            sameIdentifier: sameID, expected: expected, actual: actual,
+            sameTab: sameTab, sameURL: sameURL, oldFieldAlive: oldFieldAlive,
+            sameNativeDocument: sameNativeDocument, sameRole: sameRole) else { return false }
         target.field = field; AXUIElementSetMessagingTimeout(field, 0.12)
-        Diagnostics.log("target.rebound_same_id=true")
+        target.context = currentContext
+        target.webScoped = attribute(currentContext, kAXRoleAttribute) as? String == "AXWebArea"
+        target.toolbarScoped = hasToolbarAncestor(field)
+        target.verifiedPaste = false
+        target.disabledMethods = []; target.retryAfter = .distantPast
+        Diagnostics.log("target.rebound sameID=\(sameID) physicalDocument=\(documentWitness) originalTab=\(sameTab) exactContent=\(actual == expected)")
         return true
     }
     private func desiredValue(_ target: Target, addition: String, baseline: String?) -> String? {
@@ -915,38 +1298,60 @@ final class TextInserter {
                let field = editor(around: focused(target.pid)), let resolved = capture(field) {
                 target.field = resolved.field; target.context = resolved.context; target.identifier = resolved.identifier
                 target.contextURL = resolved.contextURL; target.windowTitle = resolved.windowTitle
+                target.navigationTab = resolved.navigationTab; target.toolbarScoped = resolved.toolbarScoped; target.webScoped = resolved.webScoped
+                target.fieldRole = resolved.fieldRole
                 target.value = resolved.value; target.selection = resolved.selection; target.keyboardOnly = false
                 Diagnostics.log("target.upgraded_to_text_client app=\(target.name)")
             }
         }
         targets.removeAll { target in
-            target !== active && target.pending.isEmpty && target.formatting.isEmpty && !sessions.values.contains(where: { $0.target === target })
+            target !== active && target.pending.isEmpty && target.delivery.inFlight == nil && target.formatting.isEmpty && !sessions.values.contains(where: { $0.target === target })
         }
-        for target in targets where !target.pending.isEmpty && Date() >= target.retryAfter {
+        for target in targets where (!target.pending.isEmpty || target.delivery.inFlight != nil) && Date() >= target.retryAfter {
         target.retryAfter = Date().addingTimeInterval(0.35)
-        let addition = target.pending
+        let foreground = isFocused(target) // Recover a proven original client before inspecting its retired AX context.
         guard logicalContextValid(target) else {
+            if let attempt = target.delivery.inFlight { target.delivery.noteFocus(attempt.id, originalContext: false, foreground: false) }
             report(target, "Открыта другая страница. Текст остаётся привязан к исходному полю и ждёт возвращения.")
             continue
         }
-        let foreground = isFocused(target)
+        if let attempt = target.delivery.inFlight {
+            target.delivery.noteFocus(attempt.id, originalContext: true, foreground: foreground)
+            let actual = target.keyboardOnly ? nil : textValue(target.field)
+            let resolution = target.delivery.observe(attempt.id, actual: actual, originalContext: true, foreground: foreground)
+            resolveReceipt(resolution, target: target, actual: actual, foreground: foreground)
+            if target.delivery.inFlight != nil { continue }
+            if target.pending.isEmpty { confirmFinals(target); continue }
+        }
         if target.keyboardOnly && target.keyboardGuard.invalidated {
             report(target, "Место ввода изменилось. Остановите запись и запустите её заново в нужном поле; текст сохранён в истории.")
             continue
         }
-        let baseline = target.keyboardOnly ? nil : textValue(target.field)
+        let snapshot = target.keyboardOnly ? EditorTextSnapshot(text: nil, permitsWholeValue: false, source: "opaque") : readText(target.field)
+        let baseline = snapshot.text
         let currentCaret = foreground && !target.keyboardOnly ? caret(target.field) : nil
+        if target.delivery.continueOnlyAtCaret {
+            guard foreground, let baseline, let currentCaret, currentCaret.length == 0,
+                  currentCaret.location >= 0, currentCaret.location <= baseline.utf16.count else {
+                report(target, "Редактор изменил вставку. Вернитесь в исходное поле и поставьте курсор без выделения; следующие слова сохранены.")
+                continue
+            }
+            target.value = baseline; target.selection = currentCaret
+            target.delivery.establishContinuationCaret()
+        }
         if let baseline {
+            if baseline != target.value { target.verifiedPaste = false }
             guard let range = InsertionPlan.rebase(expected: target.value, actual: baseline, selection: target.selection, focusedCaret: currentCaret) else {
                 report(target, "Исходное поле изменено. Текст ожидает возврата в него; назначение остаётся прежним.")
                 continue
             }
             target.value = baseline; target.selection = range
         }
+        let addition = target.pending
         let desired = desiredValue(target, addition: addition, baseline: baseline)
         let method = DeliveryPolicy.choose(foreground: foreground, hasRange: desired != nil,
-            selectedWritable: !foreground && settable(target.field, kAXSelectedTextRangeAttribute) && settable(target.field, kAXSelectedTextAttribute),
-            valueWritable: !foreground && settable(target.field, kAXValueAttribute), disabled: target.disabledMethods)
+            selectedWritable: !foreground && !target.uncertain && settable(target.field, kAXSelectedTextRangeAttribute) && settable(target.field, kAXSelectedTextAttribute),
+            valueWritable: !foreground && !target.uncertain && target.verifiedPaste && snapshot.permitsWholeValue && settable(target.field, kAXValueAttribute), disabled: target.disabledMethods)
         if method == .selectedText, let desired, let range = target.selection {
             var selection = range
             if let value = AXValueCreate(.cfRange, &selection),
@@ -972,6 +1377,26 @@ final class TextInserter {
             }
             Diagnostics.log("insert.axValue chars=\((addition as NSString).length)")
             verify(target, addition: addition, baseline: baseline, desired: desired, method: .value, restore: nil); return
+        }
+        if method == .typing {
+            let held = CGEventSource.flagsState(.combinedSessionState).intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
+            guard held.isEmpty, isFocused(target), !IsSecureEventInputEnabled() else { return }
+            busy = true
+            let source = CGEventSource(stateID: .privateState)
+            for chunk in UnicodeInputPlan.chunks(addition) {
+                let units = Array(chunk.utf16)
+                for down in [true, false] {
+                    if let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) {
+                        units.withUnsafeBufferPointer { event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: $0.baseAddress!) }
+                        event.flags = []
+                        event.setIntegerValueField(.eventSourceUserData, value: Self.eventTag)
+                        event.postToPid(target.pid)
+                    }
+                }
+            }
+            Diagnostics.log("insert.typing chars=\(addition.utf16.count)")
+            verify(target, addition: addition, baseline: baseline, desired: desired, method: .typing, restore: nil)
+            return
         }
         guard method == .paste else {
             report(target, foreground ? "Автовставка не сработала. Текст сохранён: можно скопировать невставленное из «Голоса»." : "Фоновая вставка недоступна. Текст ждёт возвращения в исходное поле «\(target.name)».")
@@ -1045,7 +1470,7 @@ final class TextInserter {
     func takePendingForManualUse() -> String {
         guard !busy else { return "" }
         let text = targets.map(\.pending).filter { !$0.isEmpty }.joined(separator: " ")
-        for target in targets { target.pending = ""; target.finalIDs = []; target.uncertain = true }
+        for target in targets { target.delivery.cancelPending(); target.finalIDs = [] }
         waitingForField = false
         return text
     }
@@ -1056,53 +1481,81 @@ final class TextInserter {
         Diagnostics.log("delivery.wait app=\(target.name) chars=\((target.pending as NSString).length) reason=\(message)")
     }
     private func confirmFinals(_ target: Target) {
-        guard !target.uncertain, target.pending.isEmpty else { return }
+        guard !target.uncertain, target.pending.isEmpty, target.delivery.inFlight == nil else { return }
         let ids = target.finalIDs; target.finalIDs = []
         for id in ids { onConfirmed?(id) }
     }
-    private func verify(_ target: Target, addition: String, baseline: String?, desired: String?, method: DeliveryMethod, restore: (() -> Void)?, attempt: Int = 0) {
+    private func resolveReceipt(_ resolution: ReceiptResolution, target: Target, actual: String?, foreground: Bool) {
+        switch resolution {
+        case .waiting:
+            report(target, "Вставка ждёт подтверждения исходного поля. Текст сохранён и будет проверен после возвращения.")
+        case .stale:
+            break
+        case .confirmed(let attempt):
+            waitingForField = false
+            target.value = actual
+            if let old = attempt.selectionBefore {
+                target.selection = CFRange(location: min(actual?.utf16.count ?? Int.max, old.location + attempt.addition.utf16.count), length: 0)
+            }
+            if foreground, let current = caret(target.field) { target.selection = current }
+            target.reported = ""
+            if attempt.method == .typing || attempt.method == .paste { target.verifiedPaste = true }
+            Diagnostics.log("insert.confirmed chars=\(attempt.addition.utf16.count)")
+            deliveryStatus = target.uncertain ? "Следующие слова введены в «\(target.name)»; предыдущая вставка осталась неподтверждённой." : "Подтверждён ввод в «\(target.name)»"
+        case .retrySafe(let attempt):
+            target.value = attempt.baseline; target.selection = attempt.selectionBefore
+            if attempt.sawDeparture { target.disabledMethods.remove(attempt.method) }
+            else { target.disabledMethods.insert(attempt.method) }
+            target.retryAfter = .distantPast
+            Diagnostics.log("insert.no_effect method=\(attempt.method.rawValue) interrupted=\(attempt.sawDeparture) retry_safe=true")
+            if attempt.method == .paste && !attempt.sawDeparture {
+                report(target, "Автовставка не сработала. Текст сохранён: можно скопировать невставленное из «Голоса».")
+            }
+        case .ambiguous(let attempt):
+            target.value = actual; target.selection = nil; target.verifiedPaste = false
+            Diagnostics.log("insert.ambiguous no_retry=true chars=\(attempt.addition.utf16.count)")
+            report(target, "Редактор изменил вставленный текст. Этот фрагмент не повторяется; следующие слова продолжатся в исходном поле. Полная фраза сохранена в истории.")
+        case .sentUnobservable:
+            target.value = actual; target.selection = foreground && !target.keyboardOnly ? caret(target.field) : nil
+            deliveryStatus = "Вставка отправлена в «\(target.name)»; редактор не подтверждает содержимое."
+        }
+        confirmFinals(target)
+    }
+    private func finishVerification(_ id: UUID) {
+        if busyAttempt == id { busyAttempt = nil; busy = false }
+        retryPending()
+    }
+    private func verify(_ target: Target, addition: String, baseline: String?, desired: String?, method: DeliveryMethod, restore: (() -> Void)?, attempt: Int = 0, receiptID: UUID? = nil) {
+        let id = receiptID ?? target.delivery.begin(addition: addition, baseline: baseline, desired: desired, selection: target.selection, method: method)
+        if receiptID == nil { busyAttempt = id }
         let delay = method == .paste && desired == nil ? 0.4 : 0.15
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            let actual = target.keyboardOnly ? nil : self.textValue(target.field)
+            guard self.targets.contains(where: { $0 === target }), target.delivery.contains(id) else {
+                restore?(); self.finishVerification(id); return
+            }
+            let foreground = self.isFocused(target)
+            let originalContext = self.logicalContextValid(target)
+            target.delivery.noteFocus(id, originalContext: originalContext, foreground: foreground)
+            let actual = originalContext && !target.keyboardOnly ? self.textValue(target.field) : nil
+            if let desired, actual == desired, (method == .selectedText || method == .value), attempt < 2 {
+                // A controlled editor can revert a setter on its next render.
+                // Observe persistence before acknowledging a background write.
+                self.verify(target, addition: addition, baseline: baseline, desired: desired, method: method, restore: restore, attempt: attempt + 1, receiptID: id)
+                return
+            }
             if let desired, actual != desired, (actual == nil || actual == baseline), attempt < 4 {
-                self.verify(target, addition: addition, baseline: baseline, desired: desired, method: method, restore: restore, attempt: attempt + 1)
+                self.verify(target, addition: addition, baseline: baseline, desired: desired, method: method, restore: restore, attempt: attempt + 1, receiptID: id)
                 return
             }
             restore?()
-            if let desired, actual == desired {
-                self.waitingForField = false
-                if target.pending.hasPrefix(addition) { target.pending.removeFirst(addition.count) }
-                target.value = actual
-                if let old = target.selection { target.selection = CFRange(location: old.location + (addition as NSString).length, length: 0) }
-                if self.isFocused(target), let current = self.caret(target.field) { target.selection = current }
-                target.uncertain = false
-                target.reported = ""
-                Diagnostics.log("insert.confirmed chars=\((addition as NSString).length)")
-                self.deliveryStatus = "Подтверждён ввод в «\(target.name)»"
-            } else if desired == nil {
-                // An editor with no readable AX value cannot acknowledge paste. Send once,
-                // never repeat a hypothesis, and never send to it while it is in the background.
-                if target.pending.hasPrefix(addition) { target.pending.removeFirst(addition.count) }
-                target.value = actual; target.selection = target.keyboardOnly ? nil : self.caret(target.field); target.uncertain = true
-                self.deliveryStatus = "Вставка отправлена в «\(target.name)»; редактор не подтверждает содержимое."
-            } else {
-                if actual == baseline {
-                    target.disabledMethods.insert(method); target.retryAfter = .distantPast
-                    Diagnostics.log("insert.no_effect method=\(method.rawValue) fallback=\(method != .paste)")
-                    if method == .paste {
-                        self.report(target, "Автовставка не сработала. Текст сохранён: можно скопировать невставленное из «Голоса».")
-                    }
-                } else {
-                    // The editor changed the value in an unknown way. Never replay an
-                    // ambiguous paste; retain the complete phrase in history.
-                    if target.pending.hasPrefix(addition) { target.pending.removeFirst(addition.count) }
-                    target.value = actual; target.selection = target.keyboardOnly ? nil : self.caret(target.field); target.uncertain = true
-                    Diagnostics.log("insert.ambiguous no_retry=true")
-                    self.report(target, "Редактор изменил вставленный текст. Повтор отключён; полная фраза сохранена в истории.")
-                }
+            let resolution = target.delivery.observe(id, actual: actual, originalContext: originalContext, foreground: foreground)
+            if case .waiting = resolution {
+                target.delivery.suspend(id)
+                target.retryAfter = Date().addingTimeInterval(0.35)
+                Diagnostics.log("insert.suspended chars=\(addition.utf16.count) readable=\(actual != nil) foreground=\(foreground)")
             }
-            self.confirmFinals(target)
-            self.busy = false; self.retryPending()
+            self.resolveReceipt(resolution, target: target, actual: actual, foreground: foreground)
+            self.finishVerification(id)
         }
     }
 }
@@ -1251,7 +1704,11 @@ final class Model: ObservableObject {
     @Published var liveTarget = ""
     @Published var shortcutHits = 0
     @Published var testingShortcut = false
+    @Published var diagnosticWindowPrefix = "GOLOS SELFTEST"
     @Published var shortcutReady = false
+    @Published var launchAtLogin = false
+    @Published var loginNeedsApproval = false
+    @Published var loginError = ""
     @Published var threshold: Double = -42 { didSet { configureAudio(); UserDefaults.standard.set(threshold, forKey: "threshold") } }
     @Published var pause: Double = 1.1 { didSet { configureAudio(); UserDefaults.standard.set(pause, forKey: "pause") } }
     var onState: (() -> Void)?
@@ -1294,7 +1751,7 @@ final class Model: ObservableObject {
             self.toggle(source: "hotkey")
         }
         hotkey.onUserInput = { [weak self] event, frontPID in
-            guard let self, self.recording || self.pending > 0 || self.inserter.pendingCharacters > 0 else { return }
+            guard let self, self.recording || self.testingInsertion || self.pending > 0 || self.inserter.pendingCharacters > 0 else { return }
             self.inserter.userActivity(event, frontPID: frontPID)
         }
         inserter.onStatus = { [weak self] message in self?.status = message }
@@ -1326,6 +1783,11 @@ final class Model: ObservableObject {
         })
         observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.recording else { return }; self.stop(reason: "sleep"); self.status = "Запись остановлена перед сном Mac."
+        })
+        observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            _ = self.hotkey.install(self.shortcut)
+            self.refreshPermissions() // Re-arm the shortcut, never the microphone.
         })
         observers.append(DistributedNotificationCenter.default().addObserver(forName: NSNotification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
             self?.stop(reason: "screen_locked")
@@ -1382,8 +1844,34 @@ final class Model: ObservableObject {
         if !accessible && recording { stop(reason: "access_revoked") }
         if accessible && (!was || !hotkey.hookReady) { _ = hotkey.install(shortcut) }
         shortcutReady = hotkey.hookReady
+        refreshLoginItem()
         onState?()
     }
+    func refreshLoginItem() {
+        let state = SMAppService.mainApp.status
+        launchAtLogin = state == .enabled || state == .requiresApproval
+        loginNeedsApproval = state == .requiresApproval
+    }
+    func configureLoginOnFirstLaunch() {
+        // Make one initial request. A later change in System Settings is the
+        // user's choice and must not be silently undone on the next launch.
+        guard !UserDefaults.standard.bool(forKey: "loginItemConfigured") else { refreshLoginItem(); return }
+        setLaunchAtLogin(true)
+    }
+    func setLaunchAtLogin(_ enabled: Bool) {
+        loginError = ""
+        do {
+            let state = SMAppService.mainApp.status
+            if enabled && state != .enabled && state != .requiresApproval { try SMAppService.mainApp.register() }
+            else if !enabled && (state == .enabled || state == .requiresApproval) { try SMAppService.mainApp.unregister() }
+            UserDefaults.standard.set(true, forKey: "loginItemConfigured")
+        } catch {
+            loginError = "Не удалось изменить автозапуск: \(error.localizedDescription)"
+        }
+        refreshLoginItem()
+        Diagnostics.log("login.registration enabled=\(SMAppService.mainApp.status == .enabled) approval=\(loginNeedsApproval) error=\(!loginError.isEmpty)")
+    }
+    func openLoginSettings() { SMAppService.openSystemSettingsLoginItems() }
     func checkAccessibility() {
         refreshPermissions(); accessibilityCheckedAt = Date()
     }
@@ -1477,6 +1965,7 @@ final class Model: ObservableObject {
         onState?()
     }
     func checkFocus() {
+        inserter.prepareFrontmost()
         if recording && inactivity.expired(at: ProcessInfo.processInfo.systemUptime) {
             stop(reason: "silence_timeout"); status = "Диктовка остановлена: 3 минуты без речи."
         }
@@ -1525,11 +2014,21 @@ final class Model: ObservableObject {
                     self.status = self.recording ? "Слушаю…" : "Микрофон выключен."
                 }
             case .failure(let error):
-                self.status = error.localizedDescription
-                if job.final {
+                if error is RecognitionFailure {
+                    if job.final {
+                        // Keep only words that passed local agreement before
+                        // this bad final; never save or paste the rejected text.
+                        let confirmed = self.inserter.committedText(job.id)
+                        self.inserter.update(job.id, text: confirmed, final: true) { delivered, _ in
+                            if let recordingID = self.historySessions.finish(job.id, text: confirmed, delivered: delivered) { self.publishHistory(recordingID) }
+                        }
+                        self.status = error.localizedDescription
+                    }
+                } else if job.final {
+                    self.status = error.localizedDescription
                     self.inserter.cancel(job.id)
                     if let recordingID = self.historySessions.finish(job.id, text: "", delivered: false) { self.publishHistory(recordingID) }
-                }
+                } else { self.status = error.localizedDescription }
             }
             self.pending = self.jobs.count
             self.decodeNext()
@@ -1545,21 +2044,31 @@ final class Model: ObservableObject {
     func testInsertion() {
         guard !testingInsertion, !recording, pending == 0 else { return }
         testingInsertion = true; settings = false
-        status = "Проверка через 6 секунд: переключитесь в пустое текстовое поле."
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-            self.inserter.insert("Проверка: диктовка работает, даже когда я переключаю окна.") { _, message in
+        status = "Проверка через 12 секунд: переключитесь в тестовое поле."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+            guard self.inserter.startDictation(testWindowPrefix: self.diagnosticWindowPrefix) else {
+                self.status = "Проверка отменена: откройте тестовое окно с указанным заголовком."
+                self.testingInsertion = false; return
+            }
+            let id = UUID(); self.liveTarget = self.inserter.begin(id)
+            self.inserter.update(id, text: "Проверка: диктовка работает, даже когда я переключаю окна.", final: true) { _, message in
                 self.status = "Проверка ввода: " + message; self.testingInsertion = false
             }
         }
     }
-    func testStreamingInsertion() {
+    func testStreamingInsertion(long: Bool = false) {
         guard !testingInsertion, !recording, pending == 0 else { return }
         testingInsertion = true; settings = false
-        status = "Потоковая проверка через 6 секунд: выберите пустое поле."
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-            self.inserter.startDictation()
+        status = "Потоковая проверка через 12 секунд: выберите тестовое поле."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+            guard self.inserter.startDictation(testWindowPrefix: self.diagnosticWindowPrefix) else {
+                self.status = "Проверка отменена: откройте тестовое окно с указанным заголовком."
+                self.testingInsertion = false; return
+            }
             let id = UUID(); self.liveTarget = self.inserter.begin(id)
-            let snapshots = ["Текст", "Текст появляется", "Текст появляется во время речи.", "Текст появляется во время речи. Product road map", "Текст появляется во время речи. Product roadmap и user research."]
+            let snapshots = long ? (1...35).map { n in (1...n).map { "Фрагмент \($0)." }.joined(separator: " ") } :
+                ["Текст", "Текст появляется", "Текст появляется во время речи.", "Текст появляется во время речи. Product road map", "Текст появляется во время речи. Product roadmap и user research."]
+            Diagnostics.log("test.streaming started=true long=\(long) expectedChars=\(snapshots.last!.utf16.count)")
             for (index, text) in snapshots.enumerated() {
                 DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 1.1) {
                     let final = index == snapshots.count - 1
@@ -1761,6 +2270,22 @@ struct SettingsView: View {
                     check: model.checkMicrophonePermission, openSettings: model.requestMicrophonePermission)
             }
             VStack(alignment: .leading, spacing: 8) {
+                Toggle("Запускать при входе в macOS", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
+                    .toggleStyle(.switch).tint(accent)
+                Text("Голос будет готов к горячей клавише. Микрофон включается только по вашему нажатию.")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                if model.loginNeedsApproval {
+                    HStack {
+                        Text("Подтвердите автозапуск в настройках macOS.").font(.system(size: 12)).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Настройки macOS", action: model.openLoginSettings)
+                    }
+                }
+                if !model.loginError.isEmpty {
+                    Text(model.loginError).font(.system(size: 12)).foregroundStyle(.orange)
+                }
+            }
+            VStack(alignment: .leading, spacing: 8) {
                 Toggle("Показывать панель диктовки", isOn: $model.showRecordingPanel)
                     .toggleStyle(.switch).tint(accent)
                 Text("При скрытой панели управляйте диктовкой горячей клавишей или через значок микрофона в строке меню. Закрытие главного окна выключает микрофон.")
@@ -1848,9 +2373,13 @@ struct DeveloperOptionsView: View {
                             Text("Нажатий: \(model.shortcutHits)").font(.system(size: 12, design: .monospaced))
                             Text(model.shortcutReady ? "Системный обработчик клавиши подключён" : "Системный обработчик недоступен")
                                 .font(.system(size: 12)).foregroundStyle(.secondary)
-                            Button(model.testingInsertion ? "Проверка запущена…" : "Проверить вставку через 6 секунд") { model.testInsertion() }
+                            Button(model.testingInsertion ? "Проверка запущена…" : "Проверить вставку через 12 секунд") { model.testInsertion() }
                                 .disabled(model.testingInsertion || model.recording || model.pending > 0)
-                            Button("Проверить потоковый ввод через 6 секунд") { model.testStreamingInsertion() }
+                            TextField("Начало заголовка тестового окна", text: $model.diagnosticWindowPrefix)
+                            Text("Проверка вводит только тестовый текст и не включает микрофон.").font(.system(size: 11)).foregroundStyle(.secondary)
+                            Button("Проверить потоковый ввод через 12 секунд") { model.testStreamingInsertion() }
+                                .disabled(model.testingInsertion || model.recording || model.pending > 0)
+                            Button("Длинная проверка возврата (35 с)") { model.testStreamingInsertion(long: true) }
                                 .disabled(model.testingInsertion || model.recording || model.pending > 0)
                         }.padding(.top, 8)
                     }.font(.system(size: 13)).tint(accent)
@@ -1955,7 +2484,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var focusTimer: Timer?
     var hud: NSPanel!
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
+        let background = StartupPolicy.background(arguments: CommandLine.arguments, loginEvent: StartupPolicy.isLoginEvent)
+        NSApp.setActivationPolicy(background ? .accessory : .regular)
         let launched = NSRunningApplication.current.launchDate ?? Date()
         let other = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.okulovsky.golos")
             .first { peer in
@@ -1964,7 +2494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return peerDate < launched || (peerDate == launched && peer.processIdentifier < ProcessInfo.processInfo.processIdentifier)
             }
         if let other {
-            other.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            if !background { other.activate(options: [.activateAllWindows, .activateIgnoringOtherApps]) }
             NSApp.terminate(nil); return
         }
         do {
@@ -1979,7 +2509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             alert.informativeText = "Проверка единственного экземпляра не прошла. Микрофон не включён. \(error.localizedDescription)"
             alert.runModal(); NSApp.terminate(nil); return
         }
-        Diagnostics.log("app.started microphone=off")
+        Diagnostics.log("app.started microphone=off background=\(background)")
         model = Model()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Голос by Okulovsky"; window.center(); window.isReleasedWhenClosed = false; window.delegate = self
@@ -2012,7 +2542,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.submenu?.addItem(withTitle: "Вставить", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.submenu?.addItem(withTitle: "Выделить всё", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         appMenu.addItem(edit); NSApp.mainMenu = appMenu
-        updateMenu(); showWindow()
+        updateMenu()
+        if !background { showWindow() }
+        model.configureLoginOnFirstLaunch()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.model.refreshPermissions() }
         focusTimer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.model.checkFocus() }
         if let focusTimer { RunLoop.main.add(focusTimer, forMode: .common) }
@@ -2024,7 +2556,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         item.button?.title = model.recording ? " RU" : ""
         toggleItem.title = (model.recording ? "Остановить" : "Начать") + " диктовку · " + model.shortcut.label
         toggleItem.isEnabled = model.ready
-        if model.showRecordingPanel && !model.autoStoppedForSilence && (model.recording || model.pending > 0 || model.waitingCharacters > 0) {
+        let showPanel = RecordingPanelPolicy.visible(enabled: model.showRecordingPanel, recording: model.recording,
+            pending: model.pending, waiting: model.waitingCharacters)
+        if hud.isVisible != showPanel {
+            Diagnostics.log("panel.visible=\(showPanel) recording=\(model.recording) pending=\(model.pending) waiting=\(model.waitingCharacters)")
+        }
+        if showPanel {
             if !hud.isVisible {
                 let frame = (NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
                 hud.setFrameOrigin(NSPoint(x: frame.midX - hud.frame.width / 2, y: frame.minY + 55))
@@ -2033,7 +2570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else { hud.orderOut(nil) }
     }
     @objc func toggle() { model.toggle(source: "menu") }
-    @objc func showWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+    @objc func showWindow() { NSApp.setActivationPolicy(.regular); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     @objc func preferences() { showWindow(); model.settings = true }
     @objc func quitApp() { NSApp.terminate(nil) }
     func windowWillClose(_ notification: Notification) {
@@ -2081,7 +2618,177 @@ if let index = CommandLine.arguments.firstIndex(of: "--probe-instance"), Command
     } catch { exit(24) }
 }
 
+if CommandLine.arguments.contains("--login-status") {
+    print("loginStatus=\(SMAppService.mainApp.status.rawValue) microphone=off bundle=\(Bundle.main.bundlePath)")
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--self-test") {
+    let unicodeSample = " Привет, product roadmap. 👩🏽‍💻 Очень, очень важно."
+    precondition(UnicodeInputPlan.chunks(unicodeSample).joined() == unicodeSample)
+    precondition(UnicodeInputPlan.chunks(" вставки").first == " вставки", "Do not trim leading spaces in a delta")
+    precondition(UnicodeInputPlan.chunks("").isEmpty)
+
+    do {
+        let baseline = "Черновик", addition = " первая часть", later = " и продолжение"
+        let desired = baseline + addition
+        let selection = CFRange(location: baseline.utf16.count, length: 0)
+        var delayed = DeliveryLifecycle()
+        delayed.pending = addition
+        let id = delayed.begin(addition: addition, baseline: baseline, desired: desired, selection: selection, method: .typing)
+        delayed.noteFocus(id, originalContext: false, foreground: false)
+        delayed.pending += later
+        delayed.suspend(id)
+        for _ in 0..<8 {
+            guard case .waiting = delayed.observe(id, actual: nil, originalContext: false, foreground: false) else {
+                preconditionFailure("Unavailable readback must preserve a dispatched prefix through arbitrarily many polls")
+            }
+        }
+        precondition(delayed.pending == addition + later && delayed.inFlight?.baseline == baseline && delayed.inFlight?.desired == desired)
+        precondition(delayed.inFlight?.selectionBefore?.location == selection.location && !delayed.uncertain)
+        guard case .waiting = delayed.observe(id, actual: desired, originalContext: true, foreground: false) else {
+            preconditionFailure("A suspended receipt cannot be acknowledged by a hidden AX cache")
+        }
+        guard case .confirmed = delayed.observe(id, actual: desired, originalContext: true, foreground: true) else {
+            preconditionFailure("Returning to already delivered text must acknowledge without another dispatch")
+        }
+        precondition(delayed.pending == later && delayed.inFlight == nil && !delayed.uncertain)
+        let next = delayed.begin(addition: later, baseline: desired, desired: desired + later, selection: CFRange(location: desired.utf16.count, length: 0), method: .typing)
+        guard case .confirmed = delayed.observe(next, actual: desired + later, originalContext: true, foreground: true) else { preconditionFailure() }
+        precondition(delayed.pending.isEmpty && !delayed.uncertain)
+
+        var unchanged = DeliveryLifecycle()
+        unchanged.pending = addition
+        let noEffect = unchanged.begin(addition: addition, baseline: baseline, desired: desired, selection: selection, method: .typing)
+        unchanged.noteFocus(noEffect, originalContext: false, foreground: false)
+        unchanged.suspend(noEffect)
+        guard case .waiting = unchanged.observe(noEffect, actual: baseline, originalContext: true, foreground: true) else { preconditionFailure() }
+        guard case .waiting = unchanged.observe(noEffect, actual: nil, originalContext: true, foreground: true) else { preconditionFailure() }
+        precondition(unchanged.inFlight?.unchangedForegroundReads == 0)
+        guard case .waiting = unchanged.observe(noEffect, actual: baseline, originalContext: true, foreground: true) else { preconditionFailure() }
+        guard case .retrySafe(let attempt) = unchanged.observe(noEffect, actual: baseline, originalContext: true, foreground: true) else {
+            preconditionFailure("Two consistent live reads of the original baseline permit retry of only the retained prefix")
+        }
+        precondition(attempt.sawDeparture && unchanged.pending == addition && unchanged.inFlight == nil && !unchanged.uncertain)
+        let retry = unchanged.begin(addition: addition, baseline: baseline, desired: desired, selection: selection, method: .typing)
+        guard case .confirmed = unchanged.observe(retry, actual: desired, originalContext: true, foreground: true) else { preconditionFailure() }
+        precondition(unchanged.pending.isEmpty)
+
+        var changed = DeliveryLifecycle()
+        changed.pending = addition + later
+        let ambiguous = changed.begin(addition: addition, baseline: baseline, desired: desired, selection: selection, method: .typing)
+        let edited = baseline + "первая часть. Ручная правка"
+        guard case .ambiguous = changed.observe(ambiguous, actual: edited, originalContext: true, foreground: true) else { preconditionFailure() }
+        precondition(changed.pending == later && changed.inFlight == nil && changed.uncertain && changed.continueOnlyAtCaret,
+            "A positively changed prefix retires once, keeps later speech, and never holds an unresolved lock")
+        changed.establishContinuationCaret()
+        let continuation = changed.begin(addition: later, baseline: edited, desired: edited + later, selection: CFRange(location: edited.utf16.count, length: 0), method: .typing)
+        guard case .confirmed = changed.observe(continuation, actual: edited + later, originalContext: true, foreground: true) else { preconditionFailure() }
+        precondition(changed.pending.isEmpty && changed.uncertain,
+            "A later confirmed delta must not falsely confirm an earlier ambiguous fragment")
+
+        var cancelled = DeliveryLifecycle()
+        cancelled.pending = addition
+        let stale = cancelled.begin(addition: addition, baseline: baseline, desired: desired, selection: selection, method: .paste)
+        cancelled.cancelPending()
+        cancelled.pending = "Новый текст"
+        let fresh = cancelled.begin(addition: cancelled.pending, baseline: "", desired: cancelled.pending, selection: CFRange(location: 0, length: 0), method: .typing)
+        guard case .stale = cancelled.observe(stale, actual: desired, originalContext: true, foreground: true) else { preconditionFailure() }
+        precondition(cancelled.contains(fresh) && cancelled.pending == "Новый текст", "A late cancelled callback cannot drain newer speech")
+
+        var opaque = DeliveryLifecycle()
+        opaque.pending = addition
+        let unobservable = opaque.begin(addition: addition, baseline: nil, desired: nil, selection: nil, method: .typing)
+        guard case .sentUnobservable = opaque.observe(unobservable, actual: nil, originalContext: true, foreground: true) else { preconditionFailure() }
+        precondition(opaque.pending.isEmpty && opaque.inFlight == nil && opaque.uncertain,
+            "An opaque client remains send-once, without an impossible receipt lock")
+    }
+
+    let hint = "Работайте с Codex"
+    let emptyFromRange = EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: hint + "\n", rangeText: "", characterCount: 0, placeholder: hint)
+    precondition(emptyFromRange.text == "" && emptyFromRange.permitsWholeValue, "A placeholder must never become existing draft text")
+    precondition(EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: hint, rangeText: nil, characterCount: 0).text == "")
+    let placeholderOnly = EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: hint + "\n", rangeText: nil, placeholder: hint)
+    precondition(placeholderOnly.text == "" && !placeholderOnly.permitsWholeValue)
+    precondition(EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: hint, rangeText: nil, characterCount: hint.utf16.count, placeholder: hint).text == hint,
+        "A user can deliberately type the same words as a placeholder")
+    precondition(EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: "Черновик\n", rangeText: nil, characterCount: 8).text == "Черновик")
+    precondition(EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: hint, rangeText: "Реальный текст", characterCount: 14).text == "Реальный текст")
+    let inconsistent = EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: "Неверное значение", rangeText: nil, characterCount: 4)
+    precondition(inconsistent.text == nil && !inconsistent.permitsWholeValue)
+    precondition(!EditorTextPolicy.snapshot(role: kAXTextAreaRole, value: "Непроверенное значение", rangeText: nil).permitsWholeValue)
+    precondition(DeliveryReceipt.classify(baseline: hint + "\n", desired: "Привет" + hint + "\n", actual: "Привет", observable: true, pastedAddition: "Привет") == .confirmed,
+        "The editor's real paste result overrides a synthetic AX baseline without replay")
+    precondition(DeliveryReceipt.classify(baseline: hint + "\n", desired: "Привет" + hint + "\n", actual: "Привет", observable: true) == .ambiguous,
+        "Whole-value writes cannot claim that unexpectedly lost draft text was delivered safely")
+    precondition(DeliveryReceipt.classify(baseline: "До", desired: "До Привет\n", actual: "До Привет", observable: true) == .confirmed)
+    precondition(DeliveryReceipt.classify(baseline: "До", desired: "До\nПривет", actual: "ДоПривет", observable: true) == .ambiguous,
+        "Never ignore edits inside the text")
+    precondition(DeliveryReceipt.classify(baseline: "Привет", desired: "ПриветПривет", actual: "Привет", observable: true, pastedAddition: "Привет") == .noEffect)
+    precondition(DeliveryReceipt.classify(baseline: "Текст", desired: "Текст\n", actual: "Текст", observable: true, pastedAddition: "\n") == .noEffect,
+        "Terminator normalization must not acknowledge an unchanged document")
+    precondition(RecordingPanelPolicy.visible(enabled: true, recording: true, pending: 0, waiting: 0))
+    precondition(!RecordingPanelPolicy.visible(enabled: true, recording: false, pending: 5, waiting: 120),
+        "Stop hides the HUD immediately even with queued delivery and late final callbacks")
+    precondition(!RecordingPanelPolicy.visible(enabled: false, recording: true, pending: 0, waiting: 0))
+    precondition(StartupPolicy.background(arguments: ["Golos"], loginEvent: true))
+    precondition(StartupPolicy.background(arguments: ["Golos", "--background"], loginEvent: false))
+    precondition(!StartupPolicy.background(arguments: ["Golos"], loginEvent: false))
+    precondition(!StartupPolicy.background(arguments: ["Golos", "--background-other"], loginEvent: false))
+    let decoderLoop = "Ищите " + Array(repeating: "качайте", count: 54).joined(separator: ", ")
+    precondition(RecognitionPolicy.rejection(decoderLoop, audioSeconds: 2.2798125) != nil, "Incident: 55 words from 2.28 seconds must never reach insertion or history")
+    precondition(RecognitionPolicy.rejection(Array(repeating: "проверяйте загрузки", count: 8).joined(separator: " "), audioSeconds: 12) == "repetition_loop")
+    precondition(RecognitionPolicy.rejection((0..<55).map { "слово\($0)" }.joined(separator: " "), audioSeconds: 2.28) == "word_rate")
+    precondition(RecognitionPolicy.rejection((0..<55).map { "слово\($0)" }.joined(separator: " "), audioSeconds: 12) == nil, "Normal long speech must not be capped to a short sentence")
+    precondition(RecognitionPolicy.rejection("Да да да да. Очень очень важно. Product roadmap и user research.", audioSeconds: 4) == nil, "Keep intentional emphasis and Russian/English terms")
+    precondition(RecognitionPolicy.rejection("НАПРЯЖЕННАЯ МУЗЫКА", audioSeconds: 4) == "sound_caption")
+    precondition(RecognitionPolicy.rejection("В фильме играет напряжённая музыка.", audioSeconds: 4) == nil)
+    let beforeSwitch = "Черновик. Первая фраза", afterInsert = beforeSwitch + " и продолжение"
+    precondition(DeliveryReceipt.classify(baseline: beforeSwitch, desired: afterInsert, actual: "", observable: false) == .unavailable,
+        "Switching a tab during acknowledgement must not discard the insertion")
+    precondition(DeliveryReceipt.classify(baseline: beforeSwitch, desired: afterInsert, actual: nil, observable: true) == .unavailable)
+    precondition(DeliveryReceipt.classify(baseline: beforeSwitch, desired: afterInsert, actual: afterInsert, observable: true) == .confirmed,
+        "Returning to an already updated field must acknowledge without pasting again")
+    precondition(DeliveryReceipt.classify(baseline: beforeSwitch, desired: afterInsert, actual: beforeSwitch, observable: true) == .noEffect,
+        "Only observing the unchanged original allows retry")
+    precondition(DeliveryReceipt.classify(baseline: beforeSwitch, desired: afterInsert, actual: "Чужой черновик", observable: true) == .ambiguous)
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: false, expected: beforeSwitch, actual: beforeSwitch),
+        "The same draft in another tab is not proof of the original document")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: true, expected: beforeSwitch, actual: beforeSwitch,
+        sameTab: false, sameURL: true, oldFieldAlive: true), "Duplicated URL, DOM ID and text must never redirect dictation")
+    precondition(FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: true, sameIdentifier: true, expected: "", actual: ""),
+        "A recreated field with the same DOM ID in the original physical web area is recoverable")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: true, sameIdentifier: false, expected: beforeSwitch, actual: beforeSwitch),
+        "Two identical filled fields in one page are not the same field without an identifier")
+    precondition(FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: true, expected: beforeSwitch, actual: beforeSwitch,
+        sameTab: true, sameURL: true, oldFieldAlive: false), "A dead web client may recover only in its original selected native tab")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: true, expected: beforeSwitch, actual: beforeSwitch,
+        sameTab: true, sameURL: true, oldFieldAlive: true), "A still-live old field cannot be replaced merely because URL and ID match")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: true, expected: beforeSwitch, actual: beforeSwitch,
+        sameTab: true, sameURL: false, oldFieldAlive: false), "An original tab navigated to another document cannot receive the old dictation")
+    precondition(FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: false, expected: beforeSwitch, actual: beforeSwitch,
+        oldFieldAlive: false, sameNativeDocument: true, sameRole: true), "A dead native client can recover in the same saved document with exact substantial content and role")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: false, expected: beforeSwitch, actual: beforeSwitch,
+        oldFieldAlive: true, sameNativeDocument: true, sameRole: true), "A live native field cannot be replaced by another equal draft")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: false, expected: "", actual: "",
+        oldFieldAlive: false, sameNativeDocument: true, sameRole: true), "An empty unspecific native field is not sufficient evidence")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: false, expected: beforeSwitch, actual: beforeSwitch,
+        oldFieldAlive: false, sameNativeDocument: true, sameRole: false), "Native recovery must preserve the original editor role")
+    precondition(NavigationScopePolicy.permitsSharedClient(hasTabWitness: true, originalTabSelected: true, titleMatches: false, invalidated: false),
+        "A native tab identity tolerates harmless title updates")
+    precondition(!NavigationScopePolicy.permitsSharedClient(hasTabWitness: true, originalTabSelected: false, titleMatches: true, invalidated: false),
+        "A reused Omnibox in a different same-title tab must not receive dictation")
+    precondition(!NavigationScopePolicy.permitsSharedClient(hasTabWitness: false, originalTabSelected: false, titleMatches: true, invalidated: true),
+        "Without a tab witness an ambiguous in-window navigation remains suspended")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: true, expected: "", actual: ""),
+        "Two empty composers are not the same destination")
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: false, expected: beforeSwitch, actual: "Чужой черновик"))
+    precondition(!FieldRecoveryPolicy.accepts(sameWindow: false, sameDocument: true, sameIdentifier: true, expected: beforeSwitch, actual: beforeSwitch))
+    var incident = StableTranscript()
+    _ = incident.offer("Ищите", final: false)
+    _ = incident.offer("Ищите", final: false)
+    if RecognitionPolicy.rejection(decoderLoop, audioSeconds: 2.2798125) == nil { _ = incident.offer(decoderLoop, final: false) }
+    precondition(incident.committed.isEmpty && incident.offer("Вот.", final: true) == "Вот.", "A rejected partial must not poison the next final")
     let lockURL = FileManager.default.temporaryDirectory.appendingPathComponent("golos-lock-test-\(UUID().uuidString)")
     do {
         var first = try InstanceLease.acquire(at: lockURL)
@@ -2237,16 +2944,18 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(EditorTextPolicy.read(role: kAXStaticTextRole, value: "", rangeText: "Actual editor text") == "Actual editor text", "Qt range text must override its empty AXValue")
     precondition(EditorTextPolicy.read(role: kAXStaticTextRole, value: "", rangeText: nil) == nil, "An unsupported range reader must not validate a frozen AXValue")
     precondition(EditorTextPolicy.read(role: kAXTextAreaRole, value: "Document", rangeText: nil) == "Document")
-    precondition(DeliveryPolicy.choose(foreground: true, hasRange: false, selectedWritable: true, valueWritable: true, disabled: []) == .paste)
+    precondition(DeliveryPolicy.choose(foreground: true, hasRange: false, selectedWritable: true, valueWritable: true, disabled: []) == .typing)
     precondition(DeliveryPolicy.choose(foreground: false, hasRange: false, selectedWritable: true, valueWritable: true, disabled: []) == nil, "Opaque editors must buffer in the background without whole-value replacement")
-    precondition(DeliveryPolicy.choose(foreground: true, hasRange: true, selectedWritable: true, valueWritable: true, disabled: []) == .paste)
+    precondition(DeliveryPolicy.choose(foreground: true, hasRange: true, selectedWritable: true, valueWritable: true, disabled: []) == .typing,
+        "Foreground input must not copy an AX placeholder into the draft")
     var rejected = Set<DeliveryMethod>()
     precondition(DeliveryPolicy.choose(foreground: false, hasRange: true, selectedWritable: true, valueWritable: true, disabled: rejected) == .selectedText)
     rejected.insert(.selectedText) // API returned success, readback proved no change.
     precondition(DeliveryPolicy.choose(foreground: false, hasRange: true, selectedWritable: true, valueWritable: true, disabled: rejected) == .value)
     rejected.insert(.value)
     precondition(DeliveryPolicy.choose(foreground: false, hasRange: true, selectedWritable: true, valueWritable: true, disabled: rejected) == nil)
-    precondition(DeliveryPolicy.choose(foreground: true, hasRange: true, selectedWritable: true, valueWritable: true, disabled: rejected) == .paste)
+    precondition(DeliveryPolicy.choose(foreground: true, hasRange: true, selectedWritable: true, valueWritable: true, disabled: rejected) == .typing)
+    rejected.insert(.typing)
     rejected.insert(.paste)
     precondition(DeliveryPolicy.choose(foreground: true, hasRange: true, selectedWritable: true, valueWritable: true, disabled: rejected) == nil)
     func stream(_ variants: [String]) -> String {
@@ -2274,12 +2983,13 @@ if CommandLine.arguments.contains("--self-test") {
     var bounded = StableTranscript()
     _ = bounded.offer("Это версия один совсем новая", final: false)
     _ = bounded.offer("Здесь вариант два довольно иной", final: false)
-    precondition(!bounded.offer("Сейчас начало три совершенно другое и задачи", final: false).isEmpty)
+    precondition(bounded.offer("Сейчас начало три совершенно другое и задачи", final: false).isEmpty, "Elapsed retries must not promote unrelated unconfirmed words")
+    precondition(!bounded.offer("Сейчас начало три совершенно другое и задачи сегодня", final: false).isEmpty, "A stable corrected hypothesis should resume on its next update")
     var revised = StableTranscript()
     precondition(revised.offer("Я открываю вкладку и там", final: false).isEmpty)
     precondition(revised.offer("Я открываю вкладку и там печатаю", final: false) == "Я открываю вкладку и там")
     precondition(revised.offer("Совершенно иная фраза", final: true).isEmpty)
-    print("PASS: generic keyboard fallback, pinned focus isolation, speech inactivity reset, one history entry per recording, late finalization and acknowledgements, legacy history compatibility, Qt text-range readback and opaque-editor delivery, writable Qt editor recognition, AppKit mouse-event regression, cross-process instance lock, recording buffer isolation, right Command tap/chord/duplicate handling, developer password, vocabulary priorities, canonical spellings, word boundaries, Russian roles, RU/EN cleanup, stable append-only streaming, hypothesis revisions, repeated finals, intentional repetitions, shortcut persistence")
+    print("PASS: unavailable receipt reconciliation, safe unchanged retry, ambiguous-prefix continuation, sticky delivery uncertainty, stale receipt cancellation, decoder-loop and word-rate guards, incident replay, unconfirmed hypothesis isolation, background login policy, generic keyboard fallback, pinned focus isolation, speech inactivity reset, one history entry per recording, late finalization and acknowledgements, legacy history compatibility, Qt text-range readback and opaque-editor delivery, writable Qt editor recognition, AppKit mouse-event regression, cross-process instance lock, recording buffer isolation, right Command tap/chord/duplicate handling, developer password, vocabulary priorities, canonical spellings, word boundaries, Russian roles, RU/EN cleanup, stable append-only streaming, hypothesis revisions, repeated finals, intentional repetitions, shortcut persistence")
     exit(0)
 }
 
@@ -2330,7 +3040,10 @@ if let index = CommandLine.arguments.firstIndex(of: "--transcribe-file"), Comman
             let start = Date()
             let final = step == frameCounts.count - 1
             guard let raw = vocabulary.prompt.withCString({ prompt in language.withCString { golos_transcribe(context, output.floatChannelData![0], Int32(count), $0, final ? 1 : 0, prompt) } }) else { fatalError("Transcription") }
-            let text = vocabulary.canonicalize(Transcript.clean(String(cString: raw)))
+            let cleaned = vocabulary.canonicalize(Transcript.clean(String(cString: raw)))
+            let rejection = RecognitionPolicy.rejection(cleaned, audioSeconds: Double(count) / 16000)
+            let text = rejection == nil ? cleaned : ""
+            if let rejection, CommandLine.arguments.contains("--stream-benchmark") { print("FILTERED: \(rejection)") }
             if CommandLine.arguments.contains("--stream-benchmark") { print("audio=\(Double(count) / 16000)s decode=\(String(format: "%.2f", Date().timeIntervalSince(start)))s: \(text)") }
             else { print(text) }
             let delta = stable.offer(text, final: final)
