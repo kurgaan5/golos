@@ -1,0 +1,64 @@
+{
+  "version": "1.7.9",
+  "build": "25",
+  "binary_sha256": "72c1c7b496c49c2fd1542aa562eaab245b2484c21a470350ac9cbe403ea20dbf",
+  "public_source_sha256": "fd92c69918646e3ec6ff69d1868bb4f0c6ffc931ca9f3d59ca0d9d36ee8e411e",
+  "self_tests": "PASS",
+  "app_files": {
+    "Contents/Info.plist": "dc254fb80fd75e445fe9be38cd889ed53fdacec571309c9b7a21ea453692922f",
+    "Contents/_CodeSignature/CodeResources": "180163b05eb9e264dee8b0dd4fac26b678e5d3f9eea7509ffa2a9f4650ceb48a",
+    "Contents/MacOS/Golos": "72c1c7b496c49c2fd1542aa562eaab245b2484c21a470350ac9cbe403ea20dbf",
+    "Contents/Resources/ThirdPartyNotices.txt": "cf2ab3c1d6d524b1674ba0bab84ae1997ffc4d15ddad2f41f8d3b474bae969b8",
+    "Contents/Resources/AppIcon.icns": "a49b604b3d58a41435ddaca80830142431fa7740c021f0b672d0ab908a4fef32",
+    "Contents/Resources/ggml-silero-v5.1.2.bin": "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+    "Contents/Resources/ggml-large-v3-turbo-q5_0.bin": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+  },
+  "audio": [
+    {
+      "fixture": "mixed-test.wav",
+      "exit_code": 0,
+      "pass": true,
+      "result": "Сегодня мы обсуждаем product roadmap and user research, а потом вернемся к задачам. Все должно работать без пауз."
+    },
+    {
+      "fixture": "room-noise-test.wav",
+      "exit_code": 0,
+      "pass": true,
+      "result": ""
+    },
+    {
+      "fixture": "vocabulary-custom-mixed.wav",
+      "exit_code": 0,
+      "pass": true,
+      "result": "Сегодня мы обсуждаем One Brain, а потом вернемся к задачам. Все должно работать без пауз."
+    }
+  ],
+  "chrome": {
+    "binary_sha256": "72c1c7b496c49c2fd1542aa562eaab245b2484c21a470350ac9cbe403ea20dbf",
+    "fragments": 90,
+    "characters": 1160,
+    "exact_match": true,
+    "input_events": 90,
+    "control_unchanged": true,
+    "tab_transitions_during_stream": [],
+    "five_returns": "NOT VERIFIED",
+    "tool_failure": "CUA action and rebind timed out twice, 30 seconds each"
+  },
+  "packages": [
+    {
+      "archive": "Golos-1.7.9-macOS-AppleSilicon.dmg",
+      "bytes": 544185506,
+      "sha256": "0dca2e2de18cc9ad0f6acf533d941ac787ca84a04cd78694e0d91eae4a764f4d"
+    },
+    {
+      "archive": "Golos-1.7.9-macOS-AppleSilicon.zip",
+      "bytes": 535655376,
+      "sha256": "88d4892e00be77f63cbaffded12199d1ced21b477abaf692b2725c3c399f4a86"
+    }
+  ],
+  "release_exception": {
+    "date": "2026-11-14",
+    "approved_by": "repository owner",
+    "type": "prerelease with incomplete live regression and known waiting-status defect"
+  }
+}

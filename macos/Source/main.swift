@@ -11,6 +11,9 @@ enum StartupPolicy {
     static func background(arguments: [String], loginEvent: Bool) -> Bool {
         loginEvent || arguments.contains("--background")
     }
+    static func showsWindow(background: Bool, inputAllowed: Bool, microphoneAllowed: Bool) -> Bool {
+        !background || !inputAllowed || !microphoneAllowed
+    }
     static var isLoginEvent: Bool {
         guard let event = NSAppleEventManager.shared().currentAppleEvent else { return false }
         return event.eventID == kAEOpenApplication &&
@@ -807,6 +810,7 @@ struct DeliveryLifecycle {
         inFlight = nil
     }
     mutating func establishContinuationCaret() { continueOnlyAtCaret = false }
+    mutating func inheritUncertainty(_ value: Bool) { uncertain = uncertain || value }
     mutating func cancelPending() {
         pending = ""; inFlight = nil; uncertain = true; continueOnlyAtCaret = false
     }
@@ -816,7 +820,9 @@ enum FieldRecoveryPolicy {
     static func accepts(sameWindow: Bool, sameDocument: Bool, sameIdentifier: Bool,
                         expected: String?, actual: String?, sameTab: Bool = false,
                         sameURL: Bool = false, oldFieldAlive: Bool = true,
-                        sameNativeDocument: Bool = false, sameRole: Bool = false) -> Bool {
+                        sameNativeDocument: Bool = false, sameRole: Bool = false,
+                        sameApplicationDocument: Bool = false, sameEditorPath: Bool = false,
+                        uniqueEditor: Bool = false, sameTitle: Bool = false) -> Bool {
         guard sameWindow else { return false }
         // sameDocument means the same physical AXWebArea, never just an equal
         // URL. A duplicated tab has the same URL, DOM IDs and possibly draft.
@@ -826,12 +832,27 @@ enum FieldRecoveryPolicy {
         // separate witness; window title or draft text alone never suffice.
         if sameNativeDocument, sameRole, !oldFieldAlive,
            let expected, expected.count >= 12, expected == actual { return true }
+        // App-window editors can have document URLs without a DOM identifier.
+        // A dead client may be replaced only at the original control location
+        // with a unique editor, unchanged document/title and substantial draft.
+        if sameApplicationDocument, sameURL, sameTitle, sameEditorPath, uniqueEditor,
+           sameRole, !oldFieldAlive, let expected, expected.count >= 12, expected == actual { return true }
         // A reload may replace the web area. Only the original selected native
         // tab, a matching document/field and a dead old client can witness it.
         guard sameTab, sameURL, sameIdentifier, !oldFieldAlive,
               let expected, let actual, expected == actual else { return false }
         return true
     }
+}
+
+struct PendingDictation: Identifiable, Equatable {
+    let id: UUID
+    let date: Date
+    let application: String
+    let characters: Int
+    let preview: String
+    let message: String
+    let canRecover: Bool
 }
 
 enum NavigationScopePolicy {
@@ -844,6 +865,8 @@ enum NavigationScopePolicy {
 final class TextInserter {
     static let eventTag: Int64 = 0x474F4C53
     private final class Target {
+        var id = UUID()
+        var date = Date()
         let pid: pid_t
         let name: String
         var field: AXUIElement
@@ -856,6 +879,8 @@ final class TextInserter {
         var toolbarScoped = false
         var webScoped = false
         var fieldRole: String?
+        var editorPath: [Int]?
+        var requiresRecovery = false
         var value: String?
         var selection: CFRange?
         var delivery = DeliveryLifecycle()
@@ -898,8 +923,22 @@ final class TextInserter {
     var onConfirmed: ((UUID) -> Void)?
     var isInserting: Bool { busy }
     func committedText(_ id: UUID) -> String { sessions[id]?.transcript.committed ?? "" }
-    var pendingCharacters: Int { targets.reduce(0) { $0 + ($1.pending as NSString).length } }
-    private(set) var waitingForField = false
+    var pendingCharacters: Int { targets.reduce(0) { $0 + $1.pending.utf16.count } }
+    var activePendingCharacters: Int { active?.pending.utf16.count ?? 0 }
+    var waitingForField: Bool { activePendingCharacters > 0 && active?.reported.isEmpty == false }
+    var startFailureReason = "Сначала выберите текстовое поле, затем нажмите горячую клавишу."
+    var queuedDictations: [PendingDictation] {
+        targets.filter { !$0.pending.isEmpty }.map { target in
+            PendingDictation(id: target.id, date: target.date, application: target.name,
+                characters: target.pending.utf16.count, preview: String(target.pending.prefix(160)),
+                message: target.delivery.inFlight != nil
+                    ? target.requiresRecovery
+                        ? "Старая вставка не подтверждена. Скопируйте текст для ручного восстановления."
+                        : "Последняя вставка ещё не подтверждена. Вернитесь в исходное поле для проверки или скопируйте текст."
+                    : target.reported.isEmpty ? "Текст ожидает вставки в исходное поле." : target.reported,
+                canRecover: target.delivery.inFlight == nil)
+        }
+    }
 
     private func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
         var value: CFTypeRef?
@@ -1001,6 +1040,43 @@ final class TextInserter {
             current = element(attribute(node, kAXParentAttribute))
         }
         return false
+    }
+    private func editorPath(_ field: AXUIElement, in root: AXUIElement?) -> [Int]? {
+        guard let root else { return nil }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.15
+        var node = field
+        var path: [Int] = []
+        for _ in 0..<20 {
+            if CFEqual(node, root) { return Array(path.reversed()) }
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  let parent = element(attribute(node, kAXParentAttribute)) else { return nil }
+            AXUIElementSetMessagingTimeout(parent, 0.02)
+            guard let children = attribute(parent, kAXChildrenAttribute) as? [AXUIElement],
+                  let index = children.firstIndex(where: { CFEqual($0, node) }) else { return nil }
+            path.append(index)
+            node = parent
+        }
+        return nil
+    }
+    private func uniqueEditor(in root: AXUIElement, matching candidate: AXUIElement, text: String) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.15
+        var stack = [root]
+        var visited: [AXUIElement] = []
+        var found = false
+        while let node = stack.popLast() {
+            guard visited.count < 300, ProcessInfo.processInfo.systemUptime < deadline else { return false }
+            if visited.contains(where: { CFEqual($0, node) }) { continue }
+            visited.append(node)
+            AXUIElementSetMessagingTimeout(node, 0.015)
+            if CFEqual(node, candidate) { found = true; continue }
+            let role = attribute(node, kAXRoleAttribute) as? String
+            if role == "AXWebArea" { continue }
+            if role == kAXTextAreaRole || role == kAXTextFieldRole || role == kAXComboBoxRole {
+                if editable(node), textValue(node) == text { return false }
+            }
+            stack.append(contentsOf: attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+        }
+        return found && ProcessInfo.processInfo.systemUptime < deadline
     }
     private func tabSelected(_ tab: AXUIElement) -> Bool {
         if (attribute(tab, kAXSelectedAttribute) as? Bool) == true { return true }
@@ -1115,36 +1191,50 @@ final class TextInserter {
         let toolbarScoped = hasToolbarAncestor(field)
         let navigationTab = webScoped || toolbarScoped ? selectedNavigationTab(in: window) : nil
         Diagnostics.log("target.identity identifier=\(identifier(field) != nil) document=\(url(context) != nil) contextRole=\(context.flatMap { attribute($0, kAXRoleAttribute) as? String } ?? "none") tab=\(navigationTab != nil) toolbar=\(toolbarScoped) reader=\(snapshot.source) wholeValue=\(snapshot.permitsWholeValue) chars=\(value?.utf16.count ?? -1)")
-        return Target(pid: pid, name: name, field: field, window: window, context: context, identifier: identifier(field), contextURL: url(context), windowTitle: window.flatMap { attribute($0, kAXTitleAttribute) as? String }, value: value, selection: selection,
+        let target = Target(pid: pid, name: name, field: field, window: window, context: context, identifier: identifier(field), contextURL: url(context), windowTitle: window.flatMap { attribute($0, kAXTitleAttribute) as? String }, value: value, selection: selection,
             navigationTab: navigationTab, toolbarScoped: toolbarScoped, webScoped: webScoped,
             fieldRole: attribute(field, kAXRoleAttribute) as? String)
+        target.editorPath = editorPath(field, in: context)
+        AXUIElementSetMessagingTimeout(field, 0.12)
+        Diagnostics.log("target.bound id=\(target.id) path=\(target.editorPath != nil)")
+        return target
     }
     private func activate(_ target: Target?) {
-        if let target {
-            // An explicit new start captures a fresh caret and document context.
-            // Retire old delivery attempts for this same physical field, so an
-            // earlier composer state cannot block or replay into the new session.
-            let previous = targets.filter { CFEqual($0.field, target.field) }
-            for old in previous {
-                for id in sessions.filter({ $0.value.target === old }).map(\.key) { sessions.removeValue(forKey: id) }
-                if !old.pending.isEmpty { Diagnostics.log("target.retired_pending chars=\((old.pending as NSString).length) retained_in_history=true") }
+        for old in targets where old !== target {
+            old.formatting.removeAll()
+            if !old.pending.isEmpty {
+                old.requiresRecovery = true
+                old.reported = "Остаток предыдущей диктовки. Выберите поле для восстановления или скопируйте текст."
+                Diagnostics.log("delivery.parked id=\(old.id) chars=\(old.pending.utf16.count)")
             }
-            targets.removeAll { old in previous.contains { $0 === old } }
         }
         active = target
-        if let target { targets.append(target); destinationName = target.name }
+        if let target {
+            targets.append(target); destinationName = target.name
+            Diagnostics.log("dictation.target id=\(target.id) app=\(target.name)")
+        }
         else { destinationName = "Щёлкните в текстовом поле" }
     }
     @discardableResult func startDictation(testWindowPrefix: String? = nil) -> Bool {
-        waitingForField = false
-        guard let front = NSWorkspace.shared.frontmostApplication, !IsSecureEventInputEnabled() else { activate(nil); return false }
+        guard let target = captureFrontTarget(testWindowPrefix: testWindowPrefix) else { return false }
+        activate(target)
+        return true
+    }
+    private func captureFrontTarget(testWindowPrefix: String? = nil) -> Target? {
+        startFailureReason = "Сначала выберите текстовое поле, затем нажмите горячую клавишу."
+        guard !IsSecureEventInputEnabled() else {
+            startFailureReason = "macOS защищает ввод клавиатуры. Закройте поле пароля и нажмите горячую клавишу снова. Если блокировка сохраняется, перезапустите приложение, в котором вводили пароль."
+            Diagnostics.log("target.blocked reason=secure_input")
+            return nil
+        }
+        guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
         let field = focused(front.processIdentifier)
         if let prefix = testWindowPrefix, !prefix.isEmpty {
             let title = focusedWindow(front.processIdentifier).flatMap { attribute($0, kAXTitleAttribute) as? String } ?? ""
             let webContext = editor(around: field).flatMap { context(of: $0) }
             let documentTitle = webContext.flatMap { attribute($0, kAXRoleAttribute) as? String == "AXWebArea" ? attribute($0, kAXTitleAttribute) as? String : nil } ?? ""
             guard title.hasPrefix(prefix) || documentTitle.hasPrefix(prefix) else {
-                Diagnostics.log("test.cancelled wrong_window=true app=\(front.localizedName ?? "?")"); return false
+                Diagnostics.log("test.cancelled wrong_window=true app=\(front.localizedName ?? "?")"); return nil
             }
         }
         let target = editor(around: field).flatMap { capture($0) } ?? keyboardTarget(pid: front.processIdentifier, anchor: field)
@@ -1152,8 +1242,7 @@ final class TextInserter {
             let role = field.flatMap { attribute($0, kAXRoleAttribute) as? String } ?? "none"
             Diagnostics.log("target.unavailable app=\(front.localizedName ?? "?") role=\(role) window=\(focusedWindow(front.processIdentifier) != nil)")
         }
-        activate(target)
-        return active != nil
+        return target
     }
     func userActivity(_ event: NSEvent, frontPID: pid_t?) {
         guard event.type == .keyDown || event.type == .leftMouseDown || event.type == .rightMouseDown else { return }
@@ -1166,7 +1255,7 @@ final class TextInserter {
                 if AXUIElementGetPid(hit, &pid) == .success { clickPID = pid }
             }
         }
-        for target in targets where (target.keyboardOnly || (target.toolbarScoped && target.navigationTab == nil)) && (target === active || !target.pending.isEmpty) {
+        for target in targets where !target.requiresRecovery && (target.keyboardOnly || (target.toolbarScoped && target.navigationTab == nil)) && (target === active || !target.pending.isEmpty) {
             // A missing AX hit while browsing another app is not an input
             // change in the pinned editor. Do not permanently revoke it.
             let inTarget = mouse ? (clickPID.map { $0 == target.pid } ?? (frontPID == target.pid)) : frontPID == target.pid
@@ -1254,7 +1343,8 @@ final class TextInserter {
         let sameID = target.identifier.map { !$0.isEmpty && identifier(field) == $0 } ?? false
         let documentWitness = sameContext && attribute(currentContext, kAXRoleAttribute) as? String == "AXWebArea"
         let sameTab = target.navigationTab.map { tabSelected($0) } ?? false
-        let oldFieldAlive = attribute(target.field, kAXRoleAttribute) != nil
+        let oldFieldAlive = attribute(target.field, kAXRoleAttribute) != nil &&
+            context(of: target.field).flatMap { old in target.context.map { CFEqual(old, $0) } } == true
         let sameRole = target.fieldRole.map { attribute(field, kAXRoleAttribute) as? String == $0 } ?? false
         let sameNativeDocument = !target.webScoped && !target.toolbarScoped && target.navigationTab == nil &&
             !hasToolbarAncestor(field) && attribute(currentContext, kAXRoleAttribute) as? String == kAXWindowRole &&
@@ -1264,17 +1354,29 @@ final class TextInserter {
         let expected = target.delivery.inFlight.flatMap { attempt in
             actual == attempt.desired ? attempt.desired : nil
         } ?? target.value
+        let sameApplicationDocument = !target.webScoped && !target.toolbarScoped && target.navigationTab == nil &&
+            !hasToolbarAncestor(field) && attribute(currentContext, kAXRoleAttribute) as? String == kAXWindowRole &&
+            sameURL && target.contextURL.flatMap { URL(string: $0)?.scheme } != nil
+        let sameTitle = target.windowTitle.map { !$0.isEmpty && attribute(window, kAXTitleAttribute) as? String == $0 } ?? false
+        let sameEditorPath = sameApplicationDocument && !oldFieldAlive &&
+            target.editorPath.map { !$0.isEmpty && editorPath(field, in: currentContext) == $0 } == true
+        let unique = sameApplicationDocument && !oldFieldAlive && sameTitle && sameEditorPath &&
+            actual.map { uniqueEditor(in: currentContext, matching: field, text: $0) } == true
+        AXUIElementSetMessagingTimeout(field, 0.12)
         guard FieldRecoveryPolicy.accepts(sameWindow: CFEqual(oldWindow, window), sameDocument: documentWitness,
             sameIdentifier: sameID, expected: expected, actual: actual,
             sameTab: sameTab, sameURL: sameURL, oldFieldAlive: oldFieldAlive,
-            sameNativeDocument: sameNativeDocument, sameRole: sameRole) else { return false }
+            sameNativeDocument: sameNativeDocument, sameRole: sameRole,
+            sameApplicationDocument: sameApplicationDocument, sameEditorPath: sameEditorPath,
+            uniqueEditor: unique, sameTitle: sameTitle) else { return false }
         target.field = field; AXUIElementSetMessagingTimeout(field, 0.12)
         target.context = currentContext
         target.webScoped = attribute(currentContext, kAXRoleAttribute) as? String == "AXWebArea"
         target.toolbarScoped = hasToolbarAncestor(field)
+        target.editorPath = editorPath(field, in: currentContext)
         target.verifiedPaste = false
         target.disabledMethods = []; target.retryAfter = .distantPast
-        Diagnostics.log("target.rebound sameID=\(sameID) physicalDocument=\(documentWitness) originalTab=\(sameTab) exactContent=\(actual == expected)")
+        Diagnostics.log("target.rebound id=\(target.id) sameID=\(sameID) physicalDocument=\(documentWitness) originalTab=\(sameTab) exactContent=\(actual == expected) nativePath=\(sameEditorPath && unique)")
         return true
     }
     private func desiredValue(_ target: Target, addition: String, baseline: String?) -> String? {
@@ -1284,7 +1386,13 @@ final class TextInserter {
     }
     func retryPending() {
         guard !busy, AXIsProcessTrusted() else { return }
-        for target in targets where target.keyboardOnly {
+        if IsSecureEventInputEnabled() {
+            if let active, !active.pending.isEmpty {
+                report(active, "macOS защищает ввод клавиатуры. Закройте поле пароля, затем вернитесь в исходное поле.")
+            }
+            return
+        }
+        for target in targets where target.keyboardOnly && !target.requiresRecovery {
             let matches = logicalContextValid(target)
             let wasInvalidated = target.keyboardGuard.invalidated
             target.keyboardGuard.observeContext(matches: matches,
@@ -1300,6 +1408,7 @@ final class TextInserter {
                 target.contextURL = resolved.contextURL; target.windowTitle = resolved.windowTitle
                 target.navigationTab = resolved.navigationTab; target.toolbarScoped = resolved.toolbarScoped; target.webScoped = resolved.webScoped
                 target.fieldRole = resolved.fieldRole
+                target.editorPath = resolved.editorPath
                 target.value = resolved.value; target.selection = resolved.selection; target.keyboardOnly = false
                 Diagnostics.log("target.upgraded_to_text_client app=\(target.name)")
             }
@@ -1307,7 +1416,7 @@ final class TextInserter {
         targets.removeAll { target in
             target !== active && target.pending.isEmpty && target.delivery.inFlight == nil && target.formatting.isEmpty && !sessions.values.contains(where: { $0.target === target })
         }
-        for target in targets where (!target.pending.isEmpty || target.delivery.inFlight != nil) && Date() >= target.retryAfter {
+        for target in targets where !target.requiresRecovery && (!target.pending.isEmpty || target.delivery.inFlight != nil) && Date() >= target.retryAfter {
         target.retryAfter = Date().addingTimeInterval(0.35)
         let foreground = isFocused(target) // Recover a proven original client before inspecting its retired AX context.
         guard logicalContextValid(target) else {
@@ -1436,7 +1545,7 @@ final class TextInserter {
     }
     private func applyFinalFormatting() {
         guard !busy else { return }
-        for target in targets where target.pending.isEmpty && !target.formatting.isEmpty {
+        for target in targets where target === active && !target.requiresRecovery && target.pending.isEmpty && !target.formatting.isEmpty {
             let task = target.formatting.removeFirst()
             guard !target.keyboardOnly, !target.uncertain, logicalContextValid(target),
                   let actual = textValue(target.field),
@@ -1471,14 +1580,46 @@ final class TextInserter {
         guard !busy else { return "" }
         let text = targets.map(\.pending).filter { !$0.isEmpty }.joined(separator: " ")
         for target in targets { target.delivery.cancelPending(); target.finalIDs = [] }
-        waitingForField = false
         return text
     }
+    func takePendingForManualUse(_ id: UUID) -> String {
+        guard !busy, let target = targets.first(where: { $0.id == id }) else { return "" }
+        let text = target.pending
+        target.delivery.cancelPending()
+        target.finalIDs = []
+        return text
+    }
+    func recoverPending(_ id: UUID) -> Bool {
+        guard !busy, let old = targets.first(where: { $0.id == id }),
+              !old.pending.isEmpty, old.delivery.inFlight == nil else {
+            startFailureReason = "Результат предыдущей вставки ещё не подтверждён. Вернитесь в исходное поле или скопируйте ожидающий текст."
+            return false
+        }
+        guard let destination = captureFrontTarget() else { return false }
+        guard transferPending(old, to: destination) else { return false }
+        retryPending()
+        return true
+    }
+    private func transferPending(_ old: Target, to destination: Target) -> Bool {
+        guard !busy, !old.pending.isEmpty, old.delivery.inFlight == nil,
+              destination.pending.isEmpty, destination.delivery.inFlight == nil else { return false }
+        let text = old.pending
+        let uncertain = old.uncertain
+        destination.id = old.id; destination.date = old.date
+        destination.finalIDs = old.finalIDs
+        destination.pending = text
+        destination.delivery.inheritUncertainty(uncertain)
+        old.delivery.cancelPending(); old.finalIDs = []; old.formatting = []
+        targets.removeAll { $0 === old }
+        activate(destination)
+        Diagnostics.log("delivery.recovery id=\(destination.id) chars=\(text.utf16.count)")
+        return true
+    }
     private func report(_ target: Target, _ message: String) {
-        waitingForField = true
         guard target.reported != message else { return }
-        target.reported = message; deliveryStatus = message
-        Diagnostics.log("delivery.wait app=\(target.name) chars=\((target.pending as NSString).length) reason=\(message)")
+        target.reported = message
+        if target === active { deliveryStatus = message }
+        Diagnostics.log("delivery.wait id=\(target.id) app=\(target.name) chars=\((target.pending as NSString).length) reason=\(message)")
     }
     private func confirmFinals(_ target: Target) {
         guard !target.uncertain, target.pending.isEmpty, target.delivery.inFlight == nil else { return }
@@ -1492,7 +1633,6 @@ final class TextInserter {
         case .stale:
             break
         case .confirmed(let attempt):
-            waitingForField = false
             target.value = actual
             if let old = attempt.selectionBefore {
                 target.selection = CFRange(location: min(actual?.utf16.count ?? Int.max, old.location + attempt.addition.utf16.count), length: 0)
@@ -1501,7 +1641,9 @@ final class TextInserter {
             target.reported = ""
             if attempt.method == .typing || attempt.method == .paste { target.verifiedPaste = true }
             Diagnostics.log("insert.confirmed chars=\(attempt.addition.utf16.count)")
-            deliveryStatus = target.uncertain ? "Следующие слова введены в «\(target.name)»; предыдущая вставка осталась неподтверждённой." : "Подтверждён ввод в «\(target.name)»"
+            if target === active {
+                deliveryStatus = target.uncertain ? "Следующие слова введены в «\(target.name)»; предыдущая вставка осталась неподтверждённой." : "Подтверждён ввод в «\(target.name)»"
+            }
         case .retrySafe(let attempt):
             target.value = attempt.baseline; target.selection = attempt.selectionBefore
             if attempt.sawDeparture { target.disabledMethods.remove(attempt.method) }
@@ -1517,7 +1659,7 @@ final class TextInserter {
             report(target, "Редактор изменил вставленный текст. Этот фрагмент не повторяется; следующие слова продолжатся в исходном поле. Полная фраза сохранена в истории.")
         case .sentUnobservable:
             target.value = actual; target.selection = foreground && !target.keyboardOnly ? caret(target.field) : nil
-            deliveryStatus = "Вставка отправлена в «\(target.name)»; редактор не подтверждает содержимое."
+            if target === active { deliveryStatus = "Вставка отправлена в «\(target.name)»; редактор не подтверждает содержимое." }
         }
         confirmFinals(target)
     }
@@ -1557,6 +1699,37 @@ final class TextInserter {
             self.resolveReceipt(resolution, target: target, actual: actual, foreground: foreground)
             self.finishVerification(id)
         }
+    }
+    static func selfTestQueueOwnership() {
+        let inserter = TextInserter()
+        let old = Target(pid: 999998, name: "Старая диктовка", field: AXUIElementCreateApplication(999998),
+            window: nil, context: nil, identifier: nil, contextURL: nil, windowTitle: nil, value: "", selection: nil)
+        let current = Target(pid: 999999, name: "Текущая диктовка", field: AXUIElementCreateApplication(999999),
+            window: nil, context: nil, identifier: nil, contextURL: nil, windowTitle: nil, value: "", selection: nil)
+        old.pending = String(repeating: "а", count: 62)
+        inserter.targets = [old]
+        inserter.active = old
+        inserter.activate(current)
+        precondition(old.requiresRecovery && old.pending.count == 62, "A new dictation must preserve an older undelivered tail")
+        precondition(inserter.activePendingCharacters == 0 && !inserter.waitingForField, "Old 62-character queue must not appear in the current HUD")
+        precondition(inserter.pendingCharacters == 62 && inserter.queuedDictations.count == 1)
+        var statusChanges = 0
+        inserter.onStatus = { _ in statusChanges += 1 }
+        inserter.report(old, "Старое поле недоступно")
+        precondition(statusChanges == 0, "An old target must not replace the current status")
+        current.pending = "текущий"
+        precondition(inserter.takePendingForManualUse(old.id).count == 62)
+        precondition(current.pending == "текущий", "Copy one queue must preserve every other dictation")
+        old.pending = "остаток"
+        let replacement = Target(pid: 999999, name: "Выбранное поле", field: current.field,
+            window: nil, context: nil, identifier: nil, contextURL: nil, windowTitle: nil, value: "", selection: nil)
+        precondition(inserter.transferPending(old, to: replacement))
+        precondition(old.pending.isEmpty && replacement.pending == "остаток" && replacement.id == old.id)
+        precondition(!inserter.transferPending(old, to: replacement), "Recovery must not transfer the same tail twice")
+        let receipt = current.delivery.begin(addition: current.pending, baseline: "", desired: current.pending, selection: nil, method: .typing)
+        precondition(!inserter.queuedDictations.first(where: { $0.id == current.id })!.canRecover)
+        precondition(!inserter.transferPending(current, to: old), "An unconfirmed insertion cannot be replayed into another field")
+        precondition(current.delivery.contains(receipt) && current.pending == "текущий")
     }
 }
 
@@ -1664,6 +1837,7 @@ final class Hotkey {
 }
 
 final class Model: ObservableObject {
+    static let inputPermissionMessage = "Разрешите «Голосу» ввод в другие приложения в macOS → Конфиденциальность и безопасность → Универсальный доступ. Затем нажмите горячую клавишу снова."
     @Published var ready = false
     @Published var recording = false
     @Published var level: Float = 0
@@ -1699,6 +1873,8 @@ final class Model: ObservableObject {
     @Published var vocabularyWarning = ""
     @Published var waitingForField = false
     @Published var waitingCharacters = 0
+    @Published var queuedDictations: [PendingDictation] = []
+    @Published var recoveryQueueID: UUID?
     @Published var inserting = false
     @Published var liveText = ""
     @Published var liveTarget = ""
@@ -1712,6 +1888,8 @@ final class Model: ObservableObject {
     @Published var threshold: Double = -42 { didSet { configureAudio(); UserDefaults.standard.set(threshold, forKey: "threshold") } }
     @Published var pause: Double = 1.1 { didSet { configureAudio(); UserDefaults.standard.set(pause, forKey: "pause") } }
     var onState: (() -> Void)?
+    var inputAccessCheck: () -> Bool = { AXIsProcessTrusted() }
+    var onPermissionRequired: (() -> Void)?
     let microphone = Microphone()
     let recognizer = Recognizer()
     let inserter = TextInserter()
@@ -1754,7 +1932,10 @@ final class Model: ObservableObject {
             guard let self, self.recording || self.testingInsertion || self.pending > 0 || self.inserter.pendingCharacters > 0 else { return }
             self.inserter.userActivity(event, frontPID: frontPID)
         }
-        inserter.onStatus = { [weak self] message in self?.status = message }
+        inserter.onStatus = { [weak self] message in
+            guard let self, self.recoveryQueueID == nil else { return }
+            self.status = message
+        }
         inserter.onConfirmed = { [weak self] id in
             guard let self, let recordingID = self.historySessions.confirm(id) else { return }
             self.publishHistory(recordingID)
@@ -1797,7 +1978,9 @@ final class Model: ObservableObject {
         recognizer.load(path: path) { [weak self] success in
             self?.ready = success
             self?.scheduleVocabularyCheck()
-            self?.status = success ? "Готово. Выберите текстовое поле и нажмите горячую клавишу." : "Не удалось загрузить Whisper. Перезапустите приложение."
+            self?.status = success
+                ? self?.accessible == true ? "Готово. Выберите текстовое поле и нажмите горячую клавишу." : Model.inputPermissionMessage
+                : "Не удалось загрузить Whisper. Перезапустите приложение."
             self?.onState?()
         }
     }
@@ -1912,6 +2095,24 @@ final class Model: ObservableObject {
     func toggle(source: String = "button") {
         Diagnostics.log("recording.request source=\(source) wasRecording=\(recording)")
         if recording { stop(reason: source); return }
+        guard inputAccessCheck() else {
+            accessible = false
+            status = Model.inputPermissionMessage
+            Diagnostics.log("recording.blocked reason=accessibility")
+            onPermissionRequired?()
+            onState?()
+            return
+        }
+        if let id = recoveryQueueID {
+            guard pending == 0, !inserter.isInserting, !closingCapture else { return }
+            if inserter.recoverPending(id) {
+                recoveryQueueID = nil
+                status = "Остаток направлен в выбранное поле."
+                checkFocus()
+            } else { status = inserter.startFailureReason }
+            onState?()
+            return
+        }
         guard ready, !permissionPending else { return }
         guard pending == 0, !inserter.isInserting, !closingCapture else {
             status = "Микрофон выключен. Дождитесь завершения предыдущей фразы и нажмите ещё раз."; return
@@ -1928,12 +2129,13 @@ final class Model: ObservableObject {
             }
         default:
             status = "Микрофон запрещён. Разрешите его в настройках конфиденциальности macOS."
+            onPermissionRequired?()
             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
         }
     }
     private func start(source: String) {
         do {
-            guard inserter.startDictation() else { status = "Сначала выберите текстовое поле, затем нажмите горячую клавишу."; return }
+            guard inserter.startDictation() else { status = inserter.startFailureReason; return }
             captureVocabulary = SpeechVocabulary(custom: customVocabulary)
             let capture = try microphone.start(); recording = true
             inactivity.begin(capture: capture, at: ProcessInfo.processInfo.systemUptime); autoStoppedForSilence = false
@@ -1970,10 +2172,13 @@ final class Model: ObservableObject {
             stop(reason: "silence_timeout"); status = "Диктовка остановлена: 3 минуты без речи."
         }
         inserter.retryPending()
-        let waiting = inserter.waitingForField && inserter.pendingCharacters > 0
-        let count = inserter.pendingCharacters
-        let changed = waitingForField != waiting || waitingCharacters != count || inserting != inserter.isInserting
+        let waiting = inserter.waitingForField
+        let count = inserter.activePendingCharacters
+        let queues = inserter.queuedDictations
+        let changed = waitingForField != waiting || waitingCharacters != count || inserting != inserter.isInserting || queuedDictations != queues
         waitingForField = waiting; waitingCharacters = count; inserting = inserter.isInserting
+        if queuedDictations != queues { queuedDictations = queues }
+        if let id = recoveryQueueID, !queues.contains(where: { $0.id == id }) { recoveryQueueID = nil }
         if changed { onState?() }
     }
     private func enqueue(id: UUID, samples: [Float], final: Bool) {
@@ -2066,7 +2271,8 @@ final class Model: ObservableObject {
                 self.testingInsertion = false; return
             }
             let id = UUID(); self.liveTarget = self.inserter.begin(id)
-            let snapshots = long ? (1...35).map { n in (1...n).map { "Фрагмент \($0)." }.joined(separator: " ") } :
+            let fragments = CommandLine.arguments.contains("--diagnostic-stream") ? 90 : 35
+            let snapshots = long ? (1...fragments).map { n in (1...n).map { "Фрагмент \($0)." }.joined(separator: " ") } :
                 ["Текст", "Текст появляется", "Текст появляется во время речи.", "Текст появляется во время речи. Product road map", "Текст появляется во время речи. Product roadmap и user research."]
             Diagnostics.log("test.streaming started=true long=\(long) expectedChars=\(snapshots.last!.utf16.count)")
             for (index, text) in snapshots.enumerated() {
@@ -2083,8 +2289,28 @@ final class Model: ObservableObject {
     func copyUndelivered() {
         guard !recording, pending == 0, !inserter.isInserting else { return }
         let text = inserter.takePendingForManualUse()
+        recoveryQueueID = nil
         if !text.isEmpty { copy(text); status = "Невставленный текст скопирован; очередь убрана. Фразы остались в истории." }
         checkFocus(); onState?()
+    }
+    func copyUndelivered(_ id: UUID) {
+        guard !recording, pending == 0, !inserter.isInserting else { return }
+        let text = inserter.takePendingForManualUse(id)
+        if recoveryQueueID == id { recoveryQueueID = nil }
+        if !text.isEmpty { copy(text); status = "Остаток этой диктовки скопирован." }
+        checkFocus(); onState?()
+    }
+    func prepareRecovery(_ id: UUID) {
+        guard !recording, pending == 0, !inserter.isInserting,
+              inserter.queuedDictations.contains(where: { $0.id == id && $0.canRecover }) else { return }
+        recoveryQueueID = id
+        status = "Щёлкните в нужном поле и нажмите \(shortcut.label), чтобы вставить остаток."
+        onState?()
+    }
+    func cancelRecovery() {
+        recoveryQueueID = nil
+        status = "Выбор поля отменён."
+        onState?()
     }
     private func publishHistory(_ recordingID: UUID) {
         if let entry = historySessions.entry(recordingID) {
@@ -2168,13 +2394,41 @@ struct ContentView: View {
             HStack {
                 Text("История диктовок").font(.system(size: 16, weight: .semibold))
                 Spacer()
-                if model.waitingCharacters > 0 {
+                if !model.queuedDictations.isEmpty {
                     Button("Скопировать невставленное") { model.copyUndelivered() }
                         .disabled(model.recording || model.pending > 0 || model.inserting)
                         .help("Скопировать ожидающий текст и убрать его из очереди автоматической вставки")
                 }
                 Button("Скопировать всё") { model.copy(model.transcript) }.disabled(model.history.isEmpty)
                 Button { model.confirmClear = true } label: { Image(systemName: "trash") }.help("Очистить историю").disabled(model.history.isEmpty)
+            }
+            if !model.recording && model.pending == 0 && !model.queuedDictations.isEmpty {
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(model.queuedDictations) { queue in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text(queue.date, style: .time)
+                                    Text(queue.application)
+                                    Spacer()
+                                    Text("\(queue.characters) символов").foregroundStyle(.secondary)
+                                }.font(.system(size: 12, weight: .medium))
+                                Text(queue.preview).font(.system(size: 13)).lineLimit(2)
+                                Text(queue.message).font(.system(size: 12)).foregroundStyle(.secondary)
+                                HStack {
+                                    Button("Скопировать остаток") { model.copyUndelivered(queue.id) }
+                                    if model.recoveryQueueID == queue.id {
+                                        Text("Выберите поле и нажмите \(model.shortcut.label)").font(.system(size: 12))
+                                        Button("Отменить") { model.cancelRecovery() }
+                                    } else {
+                                        Button("Выбрать поле для вставки…") { model.prepareRecovery(queue.id) }
+                                            .disabled(!queue.canRecover)
+                                    }
+                                }.disabled(model.recording || model.pending > 0 || model.inserting)
+                            }.padding(12).background(.white, in: RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                }.frame(maxHeight: 220)
             }
             if model.history.isEmpty {
                 VStack(spacing: 10) {
@@ -2529,6 +2783,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let quit = NSMenuItem(title: "Выйти", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self; menu.addItem(quit)
         item.menu = menu
         model.onState = { [weak self] in self?.updateMenu() }
+        model.onPermissionRequired = { [weak self] in self?.showWindow() }
         let appMenu = NSMenu()
         let root = NSMenuItem(); root.submenu = NSMenu()
         root.submenu?.addItem(withTitle: "О программе Голос", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
@@ -2543,11 +2798,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.submenu?.addItem(withTitle: "Выделить всё", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         appMenu.addItem(edit); NSApp.mainMenu = appMenu
         updateMenu()
-        if !background { showWindow() }
+        if StartupPolicy.showsWindow(background: background, inputAllowed: model.accessible,
+                                     microphoneAllowed: model.microphoneAuthorization == .authorized) {
+            showWindow()
+        }
         model.configureLoginOnFirstLaunch()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.model.refreshPermissions() }
         focusTimer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.model.checkFocus() }
         if let focusTimer { RunLoop.main.add(focusTimer, forMode: .common) }
+        if CommandLine.arguments.contains("--diagnostic-stream") {
+            if let index = CommandLine.arguments.firstIndex(of: "--diagnostic-window-prefix"),
+               CommandLine.arguments.count > index + 1 {
+                model.diagnosticWindowPrefix = CommandLine.arguments[index + 1]
+            }
+            model.testStreamingInsertion(long: true)
+        }
     }
     private func updateMenu() {
         let symbol = model.recording ? "mic.fill" : "mic"
@@ -2624,6 +2889,33 @@ if CommandLine.arguments.contains("--login-status") {
 }
 
 if CommandLine.arguments.contains("--self-test") {
+    precondition(StartupPolicy.showsWindow(background: true, inputAllowed: false, microphoneAllowed: true))
+    precondition(StartupPolicy.showsWindow(background: true, inputAllowed: true, microphoneAllowed: false))
+    precondition(!StartupPolicy.showsWindow(background: true, inputAllowed: true, microphoneAllowed: true))
+    precondition(StartupPolicy.showsWindow(background: false, inputAllowed: true, microphoneAllowed: true))
+    let deniedStartup = Model(preview: true)
+    deniedStartup.ready = false
+    deniedStartup.inputAccessCheck = { false }
+    var presentedPermissionWindow = false
+    deniedStartup.onPermissionRequired = { presentedPermissionWindow = true }
+    deniedStartup.toggle(source: "permission-regression")
+    precondition(presentedPermissionWindow && deniedStartup.status.contains("Универсальный доступ") && !deniedStartup.recording,
+        "A shortcut without input access must reveal the permission window, including while the model loads")
+    TextInserter.selfTestQueueOwnership()
+    func recoverApplicationEditor(sameURL: Bool = true, samePath: Bool = true,
+                                  unique: Bool = true, sameTitle: Bool = true,
+                                  oldAlive: Bool = false, draft: String = "Черновик исходного сообщения") -> Bool {
+        FieldRecoveryPolicy.accepts(sameWindow: true, sameDocument: false, sameIdentifier: false,
+            expected: draft, actual: draft, sameURL: sameURL, oldFieldAlive: oldAlive, sameRole: true,
+            sameApplicationDocument: true, sameEditorPath: samePath, uniqueEditor: unique, sameTitle: sameTitle)
+    }
+    precondition(recoverApplicationEditor(), "Recover a recreated application editor with a complete document/control witness")
+    precondition(!recoverApplicationEditor(sameURL: false))
+    precondition(!recoverApplicationEditor(samePath: false))
+    precondition(!recoverApplicationEditor(unique: false))
+    precondition(!recoverApplicationEditor(sameTitle: false))
+    precondition(!recoverApplicationEditor(oldAlive: true))
+    precondition(!recoverApplicationEditor(draft: ""))
     let unicodeSample = " Привет, product roadmap. 👩🏽‍💻 Очень, очень важно."
     precondition(UnicodeInputPlan.chunks(unicodeSample).joined() == unicodeSample)
     precondition(UnicodeInputPlan.chunks(" вставки").first == " вставки", "Do not trim leading spaces in a delta")
@@ -2989,7 +3281,7 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(revised.offer("Я открываю вкладку и там", final: false).isEmpty)
     precondition(revised.offer("Я открываю вкладку и там печатаю", final: false) == "Я открываю вкладку и там")
     precondition(revised.offer("Совершенно иная фраза", final: true).isEmpty)
-    print("PASS: unavailable receipt reconciliation, safe unchanged retry, ambiguous-prefix continuation, sticky delivery uncertainty, stale receipt cancellation, decoder-loop and word-rate guards, incident replay, unconfirmed hypothesis isolation, background login policy, generic keyboard fallback, pinned focus isolation, speech inactivity reset, one history entry per recording, late finalization and acknowledgements, legacy history compatibility, Qt text-range readback and opaque-editor delivery, writable Qt editor recognition, AppKit mouse-event regression, cross-process instance lock, recording buffer isolation, right Command tap/chord/duplicate handling, developer password, vocabulary priorities, canonical spellings, word boundaries, Russian roles, RU/EN cleanup, stable append-only streaming, hypothesis revisions, repeated finals, intentional repetitions, shortcut persistence")
+    print("PASS: per-dictation queue ownership, explicit tail recovery, recreated native application editor identity, unavailable receipt reconciliation, safe unchanged retry, ambiguous-prefix continuation, sticky delivery uncertainty, stale receipt cancellation, decoder-loop and word-rate guards, incident replay, unconfirmed hypothesis isolation, background login policy, generic keyboard fallback, pinned focus isolation, speech inactivity reset, one history entry per recording, late finalization and acknowledgements, legacy history compatibility, Qt text-range readback and opaque-editor delivery, writable Qt editor recognition, AppKit mouse-event regression, cross-process instance lock, recording buffer isolation, right Command tap/chord/duplicate handling, developer password, vocabulary priorities, canonical spellings, word boundaries, Russian roles, RU/EN cleanup, stable append-only streaming, hypothesis revisions, repeated finals, intentional repetitions, shortcut persistence")
     exit(0)
 }
 
