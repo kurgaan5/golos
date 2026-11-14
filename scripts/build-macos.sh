@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE="$ROOT/macos/Source"
+VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SOURCE/Info.plist")
 ARCH="$(uname -m)"
 BUILD="$ROOT/.build/macos-$ARCH"
 WHISPER="$ROOT/.build/whisper.cpp-1.8.2"
@@ -51,7 +52,7 @@ test "$("$APP/Contents/MacOS/Golos" --transcribe-file "$ROOT/tests/fixtures/room
 cp "$ROOT/MACOS.txt" "$ROOT/dist/Как пользоваться.txt"
 PACKAGE_ARCH="$ARCH"
 if [ "$ARCH" = arm64 ]; then PACKAGE_ARCH=AppleSilicon; fi
-NAME="Golos-1.7.7-macOS-$PACKAGE_ARCH.zip"
+NAME="Golos-$VERSION-macOS-$PACKAGE_ARCH.zip"
 ditto -c -k --keepParent "$APP" "$ROOT/dist/$NAME"
 (cd "$ROOT/dist" && shasum -a 256 "$NAME" > "$NAME.sha256")
 STAGE="$BUILD/dmg"
@@ -59,7 +60,7 @@ mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/Голос.app"
 ln -sfn /Applications "$STAGE/Программы"
 cp "$ROOT/MACOS.txt" "$STAGE/Как установить.txt"
-DMG="Golos-1.7.7-macOS-$PACKAGE_ARCH.dmg"
+DMG="Golos-$VERSION-macOS-$PACKAGE_ARCH.dmg"
 hdiutil create -fs HFS+ -volname "Голос" -srcfolder "$STAGE" -format UDZO -ov "$ROOT/dist/$DMG"
 hdiutil verify "$ROOT/dist/$DMG"
 (cd "$ROOT/dist" && shasum -a 256 "$DMG" > "$DMG.sha256")
